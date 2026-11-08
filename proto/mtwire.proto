@@ -1,0 +1,345 @@
+syntax = "proto3";
+
+package tgram.mtwire.v1;
+
+option optimize_for = LITE_RUNTIME;
+
+// ============================================================================
+// MTWire v1 — Canonical Binary Payload Schema (Rust prost Wire Specification)
+// Framed inside 16-byte AEAD-authenticated headers (ChaCha20-Poly1305 RFC 8439)
+// ============================================================================
+
+// Opcode registry implemented in shared `tgram-proto` crate (client & server):
+//   0x0001 OP_PING                   -> PingRequest
+//   0x0002 OP_PONG                   -> PongResponse
+//   0x000F OP_ERROR                  -> RpcError
+//   0x0010 OP_AUTH_REQ               -> AuthRequest
+//   0x0011 OP_AUTH_RES               -> AuthResponse
+//   0x0012 OP_LOGOUT_REQ             -> LogoutRequest
+//   0x0013 OP_LOGOUT_RES             -> LogoutResponse
+//   0x0020 OP_SYNC_DIALOGS_REQ       -> SyncDialogsRequest
+//   0x0021 OP_SYNC_DIALOGS_RES       -> SyncDialogsResponse
+//   0x0022 OP_GET_HISTORY_REQ        -> GetHistoryRequest
+//   0x0023 OP_GET_HISTORY_RES        -> GetHistoryResponse
+//   0x0024 OP_SEARCH_PEERS_REQ       -> SearchPeersRequest
+//   0x0025 OP_SEARCH_PEERS_RES       -> SearchPeersResponse
+//   0x0026 OP_CREATE_DIRECT_CHAT_REQ -> CreateDirectChatRequest
+//   0x0027 OP_CREATE_DIRECT_CHAT_RES -> CreateDirectChatResponse
+//   0x0030 OP_SEND_MESSAGE_REQ     -> SendMessageRequest
+//   0x0031 OP_SEND_MESSAGE_ACK     -> SendMessageAck
+//   0x0032 OP_NEW_MESSAGE_UPDATE   -> NewMessageUpdate       (Server Push, req_id = 0)
+//   0x0040 OP_READ_ACK_REQ         -> ReadAckRequest
+//   0x0041 OP_READ_ACK_RES         -> ReadAckResponse
+//   0x0042 OP_READ_HISTORY_UPDATE  -> ReadHistoryUpdate      (Server Push, req_id = 0)
+//   0x0043 OP_TYPING_EVENT_REQ     -> TypingEventRequest
+//   0x0044 OP_TYPING_UPDATE        -> TypingUpdate           (Server Push, req_id = 0)
+//   0x0045 OP_PRESENCE_UPDATE      -> PresenceUpdate         (Server Push, req_id = 0)
+//   0x0050 OP_UPLOAD_INIT_REQ      -> MediaUploadInitRequest
+//   0x0051 OP_UPLOAD_INIT_RES      -> MediaUploadInitResponse
+//   0x0052 OP_UPLOAD_CHUNK_REQ     -> MediaUploadChunkRequest
+//   0x0053 OP_UPLOAD_CHUNK_ACK     -> MediaUploadChunkAck
+//   0x0054 OP_DOWNLOAD_CHUNK_REQ   -> MediaDownloadChunkRequest
+//   0x0055 OP_DOWNLOAD_CHUNK_RES   -> MediaDownloadChunkResponse
+
+// ----------------------------------------------------------------------------
+// Common Domain Entities
+// ----------------------------------------------------------------------------
+
+enum PeerType {
+  PEER_TYPE_UNSPECIFIED = 0;
+  PEER_TYPE_DIRECT      = 1; // 1-on-1 private chat
+  PEER_TYPE_GROUP       = 2; // Multi-user group chat
+}
+
+enum UserOnlineState {
+  USER_ONLINE_STATE_UNSPECIFIED = 0;
+  USER_ONLINE_STATE_OFFLINE     = 1;
+  USER_ONLINE_STATE_ONLINE      = 2;
+}
+
+enum MessageDeliveryState {
+  MESSAGE_DELIVERY_STATE_UNSPECIFIED = 0;
+  MESSAGE_DELIVERY_STATE_SENDING     = 1; // Local optimistic clock icon
+  MESSAGE_DELIVERY_STATE_SENT        = 2; // Single check (server persisted)
+  MESSAGE_DELIVERY_STATE_READ        = 3; // Double check (recipient read)
+}
+
+enum TypingAction {
+  TYPING_ACTION_CANCEL       = 0; // Stopped typing
+  TYPING_ACTION_TYPING_TEXT  = 1; // "печатает..."
+  TYPING_ACTION_UPLOADING    = 2; // "отправляет файл..."
+}
+
+message UserProfile {
+  uint64 user_id          = 1;
+  string username         = 2; // Unique handle without '@', e.g. "durov"
+  string display_name     = 3; // Visible name, e.g. "Pavel Durov"
+  uint32 avatar_color_rgb = 4; // Deterministic fallback avatar tint (0xRRGGBB)
+  string avatar_media_id  = 5; // Optional uploaded avatar reference
+  UserOnlineState status  = 6;
+  int64 last_seen_ms      = 7; // Unix epoch milliseconds
+}
+
+message MediaAttachment {
+  string media_id    = 1;
+  string file_name   = 2;
+  string mime_type   = 3;
+  uint64 size_bytes  = 4;
+  bytes sha256_hash  = 5; // 32-byte integrity digest
+  uint32 width       = 6; // Non-zero for image previews
+  uint32 height      = 7;
+}
+
+message ChatMessage {
+  uint64 msg_id            = 1; // Monotonic per-chat or global canonical message ID
+  uint64 chat_id           = 2; // Target dialog/chat ID
+  uint64 sender_id         = 3; // Author user_id
+  uint64 client_random_id  = 4; // Client-generated 64-bit idempotency key
+  int64 timestamp_ms       = 5; // Server canonical Unix epoch milliseconds
+  string text              = 6; // UTF-8 message body
+  uint64 reply_to_msg_id   = 7; // 0 if not a reply
+  MediaAttachment media    = 8; // Optional file/image attachment
+  bool is_read             = 9; // True when max_read_outbox_msg_id >= msg_id
+  uint64 pts               = 10; // Monotonic per-user state sequence for gap detection
+}
+
+message DialogEntry {
+  uint64 chat_id                 = 1;
+  PeerType peer_type             = 2;
+  string title                   = 3; // Group title or counterpart display_name
+  uint64 peer_user_id            = 4; // Counterpart user_id for PEER_TYPE_DIRECT
+  uint32 avatar_color_rgb        = 5;
+  ChatMessage top_message        = 6; // Latest message for sidebar preview
+  uint32 unread_count            = 7; // Unread incoming messages badge count
+  uint64 read_inbox_max_msg_id   = 8; // Highest incoming msg_id read by this user
+  uint64 read_outbox_max_msg_id  = 9; // Highest outgoing msg_id read by peer (drives ✓✓)
+  bool is_pinned                 = 10;
+  int64 sort_timestamp_ms        = 11;
+}
+
+// ----------------------------------------------------------------------------
+// Transport & Error Control (0x0001 - 0x000F)
+// ----------------------------------------------------------------------------
+
+message PingRequest {
+  int64 client_timestamp_ms = 1;
+}
+
+message PongResponse {
+  int64 client_timestamp_ms = 1;
+  int64 server_timestamp_ms = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED       = 0;
+  ERROR_CODE_BAD_REQUEST       = 1;
+  ERROR_CODE_UNAUTHORIZED      = 2;
+  ERROR_CODE_INVALID_LOGIN     = 3;
+  ERROR_CODE_USERNAME_TAKEN    = 4;
+  ERROR_CODE_CHAT_NOT_FOUND    = 5;
+  ERROR_CODE_RATE_LIMITED      = 6;
+  ERROR_CODE_PAYLOAD_TOO_LARGE = 7;
+  ERROR_CODE_INTERNAL          = 8;
+}
+
+message RpcError {
+  ErrorCode code         = 1;
+  string message         = 2;
+  uint32 retry_after_ms  = 3; // Populated when code == ERROR_CODE_RATE_LIMITED
+}
+
+// ----------------------------------------------------------------------------
+// Authentication & Session Lifecycle (0x0010 - 0x001F)
+// ----------------------------------------------------------------------------
+
+enum AuthMethod {
+  AUTH_METHOD_UNSPECIFIED   = 0;
+  AUTH_METHOD_LOGIN         = 1; // Authenticate existing account via username + password
+  AUTH_METHOD_REGISTER      = 2; // Create new account + authenticate immediately
+  AUTH_METHOD_TOKEN_RESUME  = 3; // Zero-prompt reconnect using stored session_token
+}
+
+message AuthRequest {
+  AuthMethod method     = 1;
+  string username       = 2; // Required for LOGIN / REGISTER
+  string password       = 3; // Required for LOGIN / REGISTER (transmitted inside AEAD tunnel)
+  string display_name   = 4; // Used on REGISTER
+  bytes session_token   = 5; // 32-byte opaque token for AUTH_METHOD_TOKEN_RESUME
+  string device_name    = 6; // e.g., "Windows 11 x64 — TGram Desktop 1.0"
+  uint64 last_known_pts = 7; // Client's latest persisted update sequence
+}
+
+message AuthResponse {
+  UserProfile self_profile = 1;
+  bytes session_token      = 2; // 32-byte high-entropy token for SQLCipher storage
+  int64 server_time_ms     = 3;
+  uint64 current_pts       = 4;
+}
+
+message LogoutRequest {}
+
+message LogoutResponse {
+  bool revoked = 1;
+}
+
+// ----------------------------------------------------------------------------
+// Dialogs & Message History Synchronization (0x0020 - 0x002F)
+// ----------------------------------------------------------------------------
+
+message SyncDialogsRequest {
+  uint32 limit = 1; // Default 100
+}
+
+message SyncDialogsResponse {
+  repeated DialogEntry dialogs = 1;
+  repeated UserProfile users   = 2; // Referenced user profiles for O(1) cache hydration
+  uint64 current_pts           = 3;
+}
+
+message GetHistoryRequest {
+  uint64 chat_id       = 1;
+  uint64 before_msg_id = 2; // 0 = fetch newest messages; >0 = keyset cursor backward
+  uint32 limit         = 3; // Typical page = 50..100
+}
+
+message GetHistoryResponse {
+  uint64 chat_id                = 1;
+  repeated ChatMessage messages = 2; // Ordered ascending by msg_id
+  bool has_more                 = 3;
+}
+
+message SearchPeersRequest {
+  string query = 1;
+  uint32 limit = 2;
+}
+
+message SearchPeersResponse {
+  repeated UserProfile users   = 1;
+  repeated DialogEntry dialogs = 2;
+}
+
+message CreateDirectChatRequest {
+  uint64 target_user_id = 1;
+}
+
+message CreateDirectChatResponse {
+  DialogEntry dialog = 1;
+  UserProfile peer   = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Real-Time Messaging (0x0030 - 0x003F)
+// ----------------------------------------------------------------------------
+
+message SendMessageRequest {
+  uint64 chat_id          = 1; // Target chat_id (or 0 when initiating DM via target_user_id)
+  uint64 target_user_id   = 2; // Optional: auto-resolve direct chat if chat_id == 0
+  uint64 client_random_id = 3; // Mandatory 64-bit random nonce for idempotent retry
+  string text             = 4; // UTF-8 body (up to 4096 chars)
+  uint64 reply_to_msg_id  = 5;
+  string media_id         = 6; // Optional pre-uploaded MediaAttachment ID
+}
+
+message SendMessageAck {
+  uint64 chat_id           = 1;
+  uint64 client_random_id  = 2; // Echoed so client binds optimistic bubble -> canonical msg_id
+  uint64 msg_id            = 3; // Assigned canonical message ID
+  int64 server_timestamp_ms = 4;
+  uint64 pts               = 5;
+}
+
+message NewMessageUpdate {
+  ChatMessage message       = 1;
+  UserProfile sender_brief  = 2; // Included if peer might not be cached locally yet
+  uint32 unread_count       = 3; // Authoritative unread count for recipient's dialog badge
+}
+
+// ----------------------------------------------------------------------------
+// Read Receipts, Typing & Presence (0x0040 - 0x004F)
+// ----------------------------------------------------------------------------
+
+message ReadAckRequest {
+  uint64 chat_id         = 1;
+  uint64 max_read_msg_id = 2; // Marks all incoming messages <= max_read_msg_id as read
+}
+
+message ReadAckResponse {
+  uint64 chat_id         = 1;
+  uint64 max_read_msg_id = 2;
+  uint32 unread_count    = 3; // Remaining unread messages in this chat
+  uint64 pts             = 4;
+}
+
+message ReadHistoryUpdate {
+  uint64 chat_id         = 1;
+  uint64 reader_user_id  = 2;
+  uint64 max_read_msg_id = 3; // Sender promotes all own bubbles <= max_read_msg_id from ✓ to ✓✓
+  int64 read_at_ms       = 4;
+  uint64 pts             = 5;
+}
+
+message TypingEventRequest {
+  uint64 chat_id      = 1;
+  TypingAction action = 2;
+}
+
+message TypingUpdate {
+  uint64 chat_id      = 1;
+  uint64 user_id      = 2;
+  TypingAction action = 3;
+  uint32 ttl_ms       = 4; // Client auto-clears indicator after ttl_ms (default 6000 ms)
+}
+
+message PresenceUpdate {
+  uint64 user_id         = 1;
+  UserOnlineState status = 2;
+  int64 last_seen_ms     = 3;
+}
+
+// ----------------------------------------------------------------------------
+// Chunked Media Transfer (0x0050 - 0x005F)
+// ----------------------------------------------------------------------------
+
+message MediaUploadInitRequest {
+  string file_name  = 1;
+  string mime_type  = 2;
+  uint64 size_bytes = 3;
+  bytes sha256_hash = 4; // 32-byte full-file SHA-256
+  uint32 width      = 5;
+  uint32 height     = 6;
+}
+
+message MediaUploadInitResponse {
+  string upload_id       = 1;
+  uint32 chunk_size      = 2; // Recommended chunk size in bytes (e.g. 65536 = 64 KiB)
+  bool already_deduped   = 3; // True if CAS store already has identical sha256_hash
+  string ready_media_id  = 4; // Populated immediately if already_deduped == true
+}
+
+message MediaUploadChunkRequest {
+  string upload_id   = 1;
+  uint32 chunk_index = 2;
+  bytes data         = 3;
+  bool is_last_chunk = 4;
+}
+
+message MediaUploadChunkAck {
+  string upload_id      = 1;
+  uint32 chunk_index    = 2;
+  uint64 bytes_received = 3;
+  string media_id       = 4; // Populated once is_last_chunk == true and SHA-256 verifies
+}
+
+message MediaDownloadChunkRequest {
+  string media_id = 1;
+  uint64 offset   = 2;
+  uint32 length   = 3; // Max 262144 (256 KiB)
+}
+
+message MediaDownloadChunkResponse {
+  string media_id    = 1;
+  uint64 offset      = 2;
+  uint64 total_size  = 3;
+  bytes data         = 4;
+  bool eof           = 5;
+}

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "proto",
+    "server",
+    "client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Internal shared wire & crypto protocol crate
+tgram-proto = { path = "proto" }
+
+# Async runtime & zero-copy buffers
+tokio = { version = "1.43", features = ["full"] }
+bytes = "1.9"
+
+# Binary serialization (Protobuf v3 wire format without external protoc dependency)
+prost = "0.13"
+
+# Cryptography (X25519 ECDH, Ed25519 signatures, HKDF-SHA256, ChaCha20-Poly1305 AEAD, Argon2id)
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+hex = "0.4"
+
+# Server concurrency & persistence
+dashmap = "6.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+
+# Client native GPU UI (wgpu: Direct3D 12 / Vulkan / Metal) & SQLite WAL storage
+iced = { version = "0.13", features = ["canvas", "tokio", "advanced"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+crossbeam-channel = "0.5"
+rfd = "0.15"
+
+# Diagnostics & error handling
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Aggressive AOT native binary optimization (<200ms startup, minimal RSS)
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
