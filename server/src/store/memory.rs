@@ -67,6 +67,11 @@ struct ChatRecord {
     created_at_ms: i64,
 }
 
+struct StoredMediaObject {
+    uploader_user_id: u64,
+    attachment: MediaAttachment,
+}
+
 struct MemoryState {
     next_user_id: u64,
     next_chat_id: u64,
@@ -77,7 +82,7 @@ struct MemoryState {
     chats: HashMap<u64, ChatRecord>,
     direct_pairs: HashMap<(u64, u64), u64>,
     idempotency: HashMap<(u64, u64), (u64, u64)>, // (sender_id, client_random_id) -> (chat_id, msg_id)
-    media: HashMap<String, MediaAttachment>,
+    media: HashMap<String, StoredMediaObject>,
 }
 
 pub struct MemoryStore {
@@ -874,12 +879,50 @@ impl MemoryStore {
 
     pub async fn save_media_metadata(
         &self,
+        uploader_user_id: u64,
         media: &MediaAttachment,
         _now_ms: i64,
     ) -> ServerResult<()> {
         let mut guard = self.state.write().await;
-        guard.media.insert(media.media_id.clone(), media.clone());
+        guard.media.insert(
+            media.media_id.clone(),
+            StoredMediaObject {
+                uploader_user_id,
+                attachment: media.clone(),
+            },
+        );
         Ok(())
+    }
+
+    pub async fn get_media_attachment(&self, media_id: &str) -> ServerResult<Option<MediaAttachment>> {
+        let guard = self.state.read().await;
+        Ok(guard.media.get(media_id).map(|m| m.attachment.clone()))
+    }
+
+    pub async fn user_has_access_to_media(
+        &self,
+        user_id: u64,
+        media_id: &str,
+    ) -> ServerResult<bool> {
+        let guard = self.state.read().await;
+        if let Some(stored) = guard.media.get(media_id) {
+            if stored.uploader_user_id == user_id {
+                return Ok(true);
+            }
+        }
+
+        for chat in guard.chats.values() {
+            if chat.members.contains_key(&user_id)
+                && chat
+                    .messages
+                    .iter()
+                    .any(|m| m.media.as_ref().map(|a| a.media_id.as_str()) == Some(media_id))
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 }
 

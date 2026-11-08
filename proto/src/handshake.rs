@@ -16,21 +16,62 @@ use crate::opcodes::{
 
 const HKDF_INFO: &[u8] = b"MTWire-v1-AEAD-Keys";
 
-/// Deterministic default Ed25519 seed for zero-config local/LAN deployment.
-/// Override in production via `TGRAM_SERVER_KEY_HEX` and `TGRAM_SERVER_PUBKEY_HEX`.
-pub const DEFAULT_SERVER_IDENTITY_SEED: [u8; 32] = [
-    0x54, 0x47, 0x52, 0x41, 0x4D, 0x2D, 0x4E, 0x41,
-    0x54, 0x49, 0x56, 0x45, 0x2D, 0x4D, 0x54, 0x57,
-    0x49, 0x52, 0x45, 0x2D, 0x56, 0x31, 0x2D, 0x4B,
-    0x45, 0x59, 0x2D, 0x32, 0x30, 0x32, 0x36, 0x21,
-];
-
-pub fn default_server_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&DEFAULT_SERVER_IDENTITY_SEED)
+/// Generates a fresh cryptographically random Ed25519 server identity keypair using OS CSPRNG.
+pub fn generate_server_signing_key() -> SigningKey {
+    SigningKey::generate(&mut OsRng)
 }
 
-pub fn default_server_verifying_key() -> VerifyingKey {
-    default_server_signing_key().verifying_key()
+/// Parses a 32-byte Ed25519 private seed from a 64-character hex string and zeroizes intermediate buffers.
+pub fn parse_signing_key_hex(hex_str: &str) -> WireResult<SigningKey> {
+    let trimmed = hex_str.trim();
+    if trimmed.is_empty() {
+        return Err(WireError::InvalidKeyMaterial(
+            "Ed25519 private seed hex string is empty".to_owned(),
+        ));
+    }
+    let mut raw_bytes = hex::decode(trimmed)
+        .map_err(|e| WireError::InvalidKeyMaterial(format!("invalid hex encoding: {e}")))?;
+    if raw_bytes.len() != 32 {
+        let actual = raw_bytes.len();
+        raw_bytes.zeroize();
+        return Err(WireError::InvalidKeyMaterial(format!(
+            "Ed25519 seed must be exactly 32 bytes (64 hex chars), got {actual} bytes"
+        )));
+    }
+
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&raw_bytes);
+    raw_bytes.zeroize();
+
+    let key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    Ok(key)
+}
+
+/// Parses a 32-byte pinned Ed25519 server public key from a 64-character hex string.
+/// Rejects malformed hex, invalid compressed Edwards points, and weak/small-order torsion keys.
+pub fn parse_verifying_key_hex(hex_str: &str) -> WireResult<VerifyingKey> {
+    let trimmed = hex_str.trim();
+    if trimmed.is_empty() {
+        return Err(WireError::InvalidKeyMaterial(
+            "Ed25519 public key hex string is empty".to_owned(),
+        ));
+    }
+    let bytes = hex::decode(trimmed)
+        .map_err(|e| WireError::InvalidKeyMaterial(format!("invalid hex encoding: {e}")))?;
+    let key_bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        WireError::InvalidKeyMaterial(
+            "Ed25519 public key must be exactly 32 bytes (64 hex chars)".to_owned(),
+        )
+    })?;
+    let vk = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| WireError::InvalidKeyMaterial(format!("invalid Ed25519 public key: {e}")))?;
+    if vk.is_weak() {
+        return Err(WireError::InvalidKeyMaterial(
+            "weak/low-order Ed25519 public key rejected".to_owned(),
+        ));
+    }
+    Ok(vk)
 }
 
 /// 44-byte `ClientHello` wire packet.

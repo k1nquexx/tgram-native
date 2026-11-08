@@ -46,15 +46,20 @@ CREATE TABLE IF NOT EXISTS chat_members (
 CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members (user_id);
 
 CREATE TABLE IF NOT EXISTS media_objects (
-    media_id     VARCHAR(64) PRIMARY KEY,
-    file_name    VARCHAR(255) NOT NULL,
-    mime_type    VARCHAR(127) NOT NULL,
-    size_bytes   BIGINT NOT NULL,
-    sha256_hash  BYTEA NOT NULL UNIQUE,
-    width        INTEGER NOT NULL DEFAULT 0,
-    height       INTEGER NOT NULL DEFAULT 0,
-    created_at_ms BIGINT NOT NULL
+    media_id         VARCHAR(64) PRIMARY KEY,
+    uploader_user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+    file_name        VARCHAR(255) NOT NULL,
+    mime_type        VARCHAR(127) NOT NULL,
+    size_bytes       BIGINT NOT NULL,
+    sha256_hash      BYTEA NOT NULL,
+    width            INTEGER NOT NULL DEFAULT 0,
+    height           INTEGER NOT NULL DEFAULT 0,
+    created_at_ms    BIGINT NOT NULL
 );
+
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS uploader_user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE;
+ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_sha256_hash_key;
+CREATE INDEX IF NOT EXISTS idx_media_objects_uploader ON media_objects (uploader_user_id);
 
 CREATE TABLE IF NOT EXISTS messages (
     msg_id           BIGSERIAL PRIMARY KEY,
@@ -69,3 +74,4 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_history ON messages (chat_id, msg_id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_media_id ON messages (media_id) WHERE media_id IS NOT NULL;

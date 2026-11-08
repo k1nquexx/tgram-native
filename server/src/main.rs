@@ -15,7 +15,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
-    let config = ServerConfig::from_env().map_err(|e| std::io::Error::other(e))?;
+    let config = match ServerConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(error = %e, "Server configuration initialization failed");
+            return Err(std::io::Error::other(e).into());
+        }
+    };
     let listener = TcpListener::bind(config.bind_addr).await?;
 
     run_with_listener(listener, config, async {

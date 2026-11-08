@@ -65,7 +65,7 @@ Every post-handshake message is transmitted as a discrete AEAD frame (`32 bytes`
 +-------------------------------------------------------------------+
 ```
 
-### 3.1 Nonce Construction & Anti-Replay
+### 3.1 Nonce Construction, Atomic Sequence Commit & Anti-Replay
 - Both peers maintain two independent 64-bit unsigned sequence counters initialized to `0` after handshake: `c2s_seq` and `s2c_seq`.
 - For frame `seq`, the 96-bit (12-byte) RFC 8439 nonce is:
   ```text
@@ -73,7 +73,7 @@ Every post-handshake message is transmitted as a discrete AEAD frame (`32 bytes`
   nonce[4..12] = uint64_le(seq)
   ```
 - `header[0..16]` is supplied as `AAD` (Additional Authenticated Data) to `ChaCha20-Poly1305`.
-- `seq` increments by `1` after every sealed/opened frame. Any Poly1305 tag verification failure or `payload_len > 4 MiB` immediately terminates the TCP connection.
+- **Atomic Commit Guarantee:** `FrameSealer` and `FrameOpener` compute `nonce` and `seq + 1` side-effect-free first, roll back output buffers (`dst.truncate(start)`) on any serialization or AEAD failure, and commit `seq = seq + 1` **strictly after** Protobuf encoding and Poly1305 seal/open succeed. Any Poly1305 tag verification failure or `payload_len > 4 MiB` on wire ingress immediately terminates the TCP connection.
 
 ### 3.2 Header `flags` Bitmask (`uint16_le`)
 - `0x0001` (`FLAG_SERVER_PUSH`): Frame initiated asynchronously by server (`req_id == 0`).

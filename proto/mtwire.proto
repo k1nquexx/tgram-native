@@ -312,8 +312,8 @@ message MediaUploadInitRequest {
 message MediaUploadInitResponse {
   string upload_id       = 1;
   uint32 chunk_size      = 2; // Recommended chunk size in bytes (e.g. 65536 = 64 KiB)
-  bool already_deduped   = 3; // True if CAS store already has identical sha256_hash
-  string ready_media_id  = 4; // Populated immediately if already_deduped == true
+  bool already_deduped   = 3; // Reserved (always false; hash-only CAS disabled against CWE-639/CWE-345)
+  string ready_media_id  = 4; // Reserved (always empty; full proof-of-possession upload required)
 }
 
 message MediaUploadChunkRequest {

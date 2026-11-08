@@ -39,7 +39,16 @@ where
         StorageEngine::new_memory(config.seed_demo_data)
     };
 
-    let media = Arc::new(MediaManager::new(config.media_dir.clone()).await?);
+    let media = Arc::new(
+        MediaManager::with_limits(
+            config.media_dir.clone(),
+            config.max_uploads_per_user,
+            config.max_total_uploads,
+            config.upload_session_ttl,
+        )
+        .await?,
+    );
+    let cleanup_worker = MediaManager::start_cleanup_worker(Arc::clone(&media));
     let hub = RealtimeHub::new(store, media);
     let config = Arc::new(config);
 
@@ -82,6 +91,9 @@ where
             }
         }
     }
+
+    cleanup_worker.abort();
+    hub.media.abort_all_uploads().await;
 
     Ok(())
 }

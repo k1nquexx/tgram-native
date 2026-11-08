@@ -19,7 +19,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use tgram_proto::{
-    default_server_verifying_key, flags, perform_client_handshake, AuthMethod, AuthRequest,
+    flags, parse_verifying_key_hex, perform_client_handshake, AuthMethod, AuthRequest,
     AuthResponse, CreateDirectChatRequest, CreateDirectChatResponse, DecodedFrame,
     GetHistoryRequest, GetHistoryResponse, LogoutRequest, MediaAttachment,
     MediaDownloadChunkRequest, MediaDownloadChunkResponse, MediaUploadChunkAck,
@@ -125,8 +125,29 @@ impl SessionRpcClient {
 #[derive(Clone)]
 struct ActiveConnectionTarget {
     server_addr: String,
+    server_pubkey_hex: String,
+    pinned_key: VerifyingKey,
     auth_req: AuthRequest,
     is_interactive_auth: bool,
+}
+
+fn build_connection_target(
+    server_addr: String,
+    server_pubkey_hex: String,
+    auth_req: AuthRequest,
+) -> Result<ActiveConnectionTarget, String> {
+    let clean_hex = server_pubkey_hex.trim().to_owned();
+    let pinned_key = parse_verifying_key_hex(&clean_hex).map_err(|_| {
+        "Некорректный публичный ключ сервера Ed25519 (ожидается 64 HEX-символа)".to_owned()
+    })?;
+    let is_interactive_auth = auth_req.method != AuthMethod::TokenResume as i32;
+    Ok(ActiveConnectionTarget {
+        server_addr,
+        server_pubkey_hex: clean_hex,
+        pinned_key,
+        auth_req,
+        is_interactive_auth,
+    })
 }
 
 /// Spawns the dedicated `NetworkThread` running an isolated Tokio event loop (IOCP / epoll / kqueue).
@@ -151,25 +172,11 @@ pub fn spawn_network_thread(
     cmd_tx
 }
 
-fn load_pinned_server_key() -> VerifyingKey {
-    if let Ok(hex_str) = std::env::var("TGRAM_SERVER_PUBKEY_HEX") {
-        if let Ok(bytes) = hex::decode(hex_str.trim()) {
-            if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                if let Ok(vk) = VerifyingKey::from_bytes(&arr) {
-                    return vk;
-                }
-            }
-        }
-    }
-    default_server_verifying_key()
-}
-
 async fn network_supervisor_loop(
     mut cmd_rx: UnboundedReceiver<NetCommand>,
     storage_tx: CrossbeamSender<StorageCommand>,
     ui_tx: UnboundedSender<BackendEvent>,
 ) {
-    let pinned_key = load_pinned_server_key();
     let mut target: Option<ActiveConnectionTarget> = None;
     let mut outbox_queue: VecDeque<SendMessageRequest> = VecDeque::new();
     let mut reconnect_attempt: u32 = 0;
@@ -180,14 +187,24 @@ async fn network_supervisor_loop(
             let Some(cmd) = cmd_rx.recv().await else {
                 break;
             };
-            if let NetCommand::ConnectAndAuth { server_addr, req } = cmd {
-                let is_interactive = req.method != AuthMethod::TokenResume as i32;
-                target = Some(ActiveConnectionTarget {
-                    server_addr,
-                    auth_req: req,
-                    is_interactive_auth: is_interactive,
-                });
-                reconnect_attempt = 0;
+            if let NetCommand::ConnectAndAuth {
+                server_addr,
+                server_pubkey_hex,
+                req,
+            } = cmd
+            {
+                match build_connection_target(server_addr, server_pubkey_hex, req) {
+                    Ok(new_target) => {
+                        target = Some(new_target);
+                        reconnect_attempt = 0;
+                    }
+                    Err(err_msg) => {
+                        let _ = ui_tx.send(BackendEvent::AuthFailed(err_msg));
+                        let _ = ui_tx.send(BackendEvent::ConnectionChanged(
+                            ConnectionState::Disconnected,
+                        ));
+                    }
+                }
             }
             continue;
         };
@@ -205,14 +222,21 @@ async fn network_supervisor_loop(
                 _ = sleep(Duration::from_millis(backoff_ms)) => {}
                 maybe_cmd = cmd_rx.recv() => {
                     match maybe_cmd {
-                        Some(NetCommand::ConnectAndAuth { server_addr, req }) => {
-                            let is_interactive = req.method != AuthMethod::TokenResume as i32;
-                            target = Some(ActiveConnectionTarget {
-                                server_addr,
-                                auth_req: req,
-                                is_interactive_auth: is_interactive,
-                            });
-                            reconnect_attempt = 0;
+                        Some(NetCommand::ConnectAndAuth { server_addr, server_pubkey_hex, req }) => {
+                            match build_connection_target(server_addr, server_pubkey_hex, req) {
+                                Ok(new_target) => {
+                                    target = Some(new_target);
+                                    reconnect_attempt = 0;
+                                }
+                                Err(err_msg) => {
+                                    target = None;
+                                    reconnect_attempt = 0;
+                                    let _ = ui_tx.send(BackendEvent::AuthFailed(err_msg));
+                                    let _ = ui_tx.send(BackendEvent::ConnectionChanged(
+                                        ConnectionState::Disconnected,
+                                    ));
+                                }
+                            }
                             continue;
                         }
                         Some(NetCommand::LogoutAndDisconnect) => {
@@ -243,7 +267,6 @@ async fn network_supervisor_loop(
 
         let outcome = run_single_connection_cycle(
             &current_target,
-            &pinned_key,
             &mut cmd_rx,
             &mut outbox_queue,
             &storage_tx,
@@ -287,6 +310,8 @@ async fn network_supervisor_loop(
                 // Promote target to seamless TokenResume for automatic reconnects
                 target = Some(ActiveConnectionTarget {
                     server_addr,
+                    server_pubkey_hex: current_target.server_pubkey_hex.clone(),
+                    pinned_key: current_target.pinned_key,
                     auth_req: AuthRequest {
                         method: AuthMethod::TokenResume as i32,
                         username: String::new(),
@@ -335,7 +360,6 @@ enum CycleExit {
 
 async fn run_single_connection_cycle(
     target: &ActiveConnectionTarget,
-    pinned_key: &VerifyingKey,
     cmd_rx: &mut UnboundedReceiver<NetCommand>,
     outbox_queue: &mut VecDeque<SendMessageRequest>,
     storage_tx: &CrossbeamSender<StorageCommand>,
@@ -353,16 +377,20 @@ async fn run_single_connection_cycle(
         ConnectionState::Handshaking,
     ));
 
-    let (mut sealer, mut opener) =
-        match timeout(HANDSHAKE_TIMEOUT, perform_client_handshake(&mut stream, pinned_key)).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => return CycleExit::NetworkFailedBeforeAuth(e.to_string()),
-            Err(_) => {
-                return CycleExit::NetworkFailedBeforeAuth(
-                    "таймаут криптографического рукопожатия".to_owned(),
-                )
-            }
-        };
+    let (mut sealer, mut opener) = match timeout(
+        HANDSHAKE_TIMEOUT,
+        perform_client_handshake(&mut stream, &target.pinned_key),
+    )
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return CycleExit::NetworkFailedBeforeAuth(e.to_string()),
+        Err(_) => {
+            return CycleExit::NetworkFailedBeforeAuth(
+                "таймаут криптографического рукопожатия".to_owned(),
+            )
+        }
+    };
 
     let _ = ui_tx.send(BackendEvent::ConnectionChanged(
         ConnectionState::Authenticating,
@@ -467,6 +495,7 @@ async fn run_single_connection_cycle(
 
     let _ = storage_tx.send(StorageCommand::SaveSession(SavedSession {
         server_addr: target.server_addr.clone(),
+        server_pubkey_hex: target.server_pubkey_hex.clone(),
         self_profile: profile.clone(),
         session_token: session_token.clone(),
         last_pts,
@@ -475,6 +504,7 @@ async fn run_single_connection_cycle(
     let _ = ui_tx.send(BackendEvent::ConnectionChanged(ConnectionState::Online));
     let _ = ui_tx.send(BackendEvent::AuthSucceeded {
         server_addr: target.server_addr.clone(),
+        server_pubkey_hex: target.server_pubkey_hex.clone(),
         profile: profile.clone(),
         session_token: session_token.clone(),
         current_pts: last_pts,
@@ -530,14 +560,16 @@ async fn run_single_connection_cycle(
                 };
 
                 match cmd {
-                    NetCommand::ConnectAndAuth { server_addr, req } => {
-                        let is_interactive = req.method != AuthMethod::TokenResume as i32;
-                        break CycleExit::SwitchTarget(ActiveConnectionTarget {
-                            server_addr,
-                            auth_req: req,
-                            is_interactive_auth: is_interactive,
-                        });
-                    }
+                    NetCommand::ConnectAndAuth {
+                        server_addr,
+                        server_pubkey_hex,
+                        req,
+                    } => match build_connection_target(server_addr, server_pubkey_hex, req) {
+                        Ok(new_target) => break CycleExit::SwitchTarget(new_target),
+                        Err(err_msg) => {
+                            let _ = ui_tx.send(BackendEvent::AuthFailed(err_msg));
+                        }
+                    },
 
                     NetCommand::LogoutAndDisconnect => {
                         let _ = rpc
@@ -949,9 +981,11 @@ async fn upload_and_send_media_task(
         )
         .await?;
 
-    let final_media_id = if init_res.already_deduped && !init_res.ready_media_id.is_empty() {
-        init_res.ready_media_id
-    } else {
+    if init_res.upload_id.trim().is_empty() {
+        return Err("сервер не выдал идентификатор загрузки upload_id".to_owned());
+    }
+
+    let final_media_id = {
         let chunk_sz = init_res.chunk_size.clamp(16 * 1024, 128 * 1024) as usize;
         let mut reader = File::open(&file_path).await.map_err(|e| e.to_string())?;
         let mut chunk_buf = vec![0u8; chunk_sz];

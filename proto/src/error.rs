@@ -24,6 +24,9 @@ pub enum WireError {
     #[error("invalid server Ed25519 identity key or signature verification failed")]
     InvalidServerSignature,
 
+    #[error("invalid Ed25519 key material: {0}")]
+    InvalidKeyMaterial(String),
+
     #[error("frame payload length {0} bytes exceeds limit ({1} bytes)")]
     FrameTooLarge(u32, u32),
 

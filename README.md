@@ -13,7 +13,9 @@
   2. `Network Thread` (`tgram-network`) — изолированный цикл событий `Tokio` (`TCP_NODELAY`), 1-RTT рукопожатие, мультиплексирование RPC, `Ping/Pong` keep-alive и авто-реконнект с `TokenResume`.
   3. `Storage Thread` (`tgram-storage`) — локальная БД **SQLite3** в режиме **`WAL`** (`mmap_size = 64 MB`) с AEAD-шифрованием всех записей и токенов на диске (`ChaCha20-Poly1305`). Мастер-ключ хранится в системном хранилище ОС через `keyring` (Windows Credential Manager / macOS Keychain / Linux Secret Service) или выводится через **Argon2id** из мастер-пароля `TGRAM_DB_KEY` (Passcode Lock).
 - **Собственный бинарный криптопротокол `MTWire v1`:**
-  - `X25519` (эфемерный ECDH, Perfect Forward Secrecy) + `Ed25519` (подпись транскрипта против MITM) + `HKDF-SHA256` + `ChaCha20-Poly1305` (in-place шифрование фреймов без лишних аллокаций) + `Protobuf v3` (`prost`, без внешней зависимости от `protoc`).
+  - `X25519` (эфемерный ECDH, Perfect Forward Secrecy) + `Ed25519` (строгий пиннинг внешнего серверного ключа `TGRAM_SERVER_KEY_HEX` / `TGRAM_SERVER_PUBKEY_HEX` без зашитых дефолтных сидов, `Zeroize` ключевого материала) + `HKDF-SHA256` + `ChaCha20-Poly1305` (атомарное in-place шифрование фреймов без десинхронизации sequence-счётчика) + `Protobuf v3` (`prost`).
+- **Защита медиа-хранилища (Zero IDOR & Anti-DoS):**
+  - Загрузка файлов требует полного подтверждения владения байтами (`Proof-of-Possession` SHA-256 без уязвимой CAS-дедупликации по хэшу), строгой проверки членства пользователя в чате (`user_has_access_to_media`) при скачивании и прикреплении `media_id`, квотирования активных сессий на пользователя (`RAII UploadSlotGuard`) и фонового сборщика заброшенных `.part`-файлов по монотонному TTL.
 - **Максимальная AOT-оптимизация бинарника:** `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`, `panic = "abort"`, `strip = "symbols"`.
 
 ---
@@ -29,8 +31,8 @@ tgram-native/
 │   └── src/
 ├── server/                     # Крейт `tgram-server`: асинхронный TCP-сервер реального времени
 │   ├── migrations/001_init.sql # Схема PostgreSQL
-│   ├── src/                    # Hub (64-шардовый DashMap), Auth (Argon2id), Media CAS, Store (RAM / PG+Redis)
-│   └── tests/realtime_e2e.rs   # Интеграционный E2E-тест протокола и маршрутизации
+│   ├── src/                    # Hub (64-шардовый DashMap), Auth (Argon2id), Media ACL + TTL GC, Store (RAM / PG+Redis)
+│   └── tests/realtime_e2e.rs   # Интеграционные E2E-тесты протокола, изоляции Media IDOR и DoS-защиты
 └── client/                     # Крейт `tgram-client` (бинарь `tgram-desktop`)
     └── src/
         ├── domain.rs           # Модели UI и каналы межпоточного взаимодействия
@@ -43,8 +45,8 @@ tgram-native/
 
 ## Быстрый запуск и тестирование
 
-### 1. Прогон модульных и E2E-тестов
-Проверяет криптографическое рукопожатие `X25519 + Ed25519`, защиту от подмены заголовков AAD/MITM, регистрацию, мгновенную доставку сообщений, индикаторы `печатает...` и двойные галочки прочтения (`✓` -> `✓✓`):
+### 1. Прогон модульных, property/fuzz и E2E-тестов безопасности
+Проверяет криптографическое рукопожатие `X25519 + Ed25519`, защиту от MITM и подмены AAD, атомарность счётчика nonce на фрагментированных потоках, изоляцию доступа к медиафайлам (анти-IDOR / отказ CAS-пробинга), защиту от исчерпания файловых дескрипторов и доставку сообщений (`✓` -> `✓✓`):
 ```powershell
 cargo test --workspace
 ```
@@ -54,12 +56,18 @@ cargo test --workspace
 cargo build --release --workspace
 ```
 
-### 3. Запуск сервера (Zero-Setup режим в памяти или PostgreSQL + Redis)
-По умолчанию сервер слушает `0.0.0.0:4430` в быстром конкурентном In-Memory режиме с предсозданным демо-чатом (не требует поднятия внешних СУБД для локального теста):
+### 3. Генерация ключа сервера и запуск (`In-Memory` или `PostgreSQL + Redis`)
+Сервер **не содержит зашитых приватных ключей** и требует явного задания 32-байтного сида `TGRAM_SERVER_KEY_HEX` (64 HEX-символа). При старте сервер выведет в лог соответствующий публичный ключ `ed25519_pubkey` для клиентов:
+
 ```powershell
+# Сгенерировать криптостойкий 32-байтный ключ (PowerShell):
+$bytes = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$env:TGRAM_SERVER_KEY_HEX = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+
+# Запуск в быстром In-Memory режиме (слушает 0.0.0.0:4430):
 cargo run --release -p tgram-server
 ```
-Для production-режима с **PostgreSQL + Redis** достаточно задать переменные окружения:
+Для production-режима с **PostgreSQL + Redis** дополнительно задайте:
 ```powershell
 $env:DATABASE_URL = "postgres://postgres:postgres@127.0.0.1:5432/tgram"
 $env:REDIS_URL = "redis://127.0.0.1:6379"
@@ -67,15 +75,17 @@ cargo run --release -p tgram-server
 ```
 
 ### 4. Запуск двух независимых клиентов на одной машине
-Каждый профиль хранит собственную зашифрованную БД `SQLite3 WAL` (`./data/client_<profile>.sqlite3`) и папку загрузок:
+Скопируйте `ed25519_pubkey` из первой строки лога `tgram-server` и передайте его через `TGRAM_SERVER_PUBKEY_HEX`, флаг `--server-pubkey` либо вставьте прямо в поле **«Публичный ключ сервера Ed25519 (64 HEX)»** на экране входа (после успешного входа ключ сохраняется в зашифрованном хранилище `SQLite3 WAL` для автоматического `TokenResume`):
 
 **Терминал 1 (Алиса):**
 ```powershell
+$env:TGRAM_SERVER_PUBKEY_HEX = "<ed25519_pubkey_из_лога_сервера>"
 cargo run --release -p tgram-client -- --profile alice
 ```
 
 **Терминал 2 (Боб):**
 ```powershell
+$env:TGRAM_SERVER_PUBKEY_HEX = "<ed25519_pubkey_из_лога_сервера>"
 cargo run --release -p tgram-client -- --profile bob
 ```
 

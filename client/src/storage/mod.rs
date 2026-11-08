@@ -26,6 +26,8 @@ struct StoredSessionRecord {
     session_token: Vec<u8>,
     #[prost(uint64, tag = "4")]
     last_pts: u64,
+    #[prost(string, tag = "5")]
+    server_pubkey_hex: String,
 }
 
 /// Spawns the dedicated `StorageThread` owning the encrypted SQLite3 WAL connection.
@@ -232,6 +234,7 @@ fn handle_load_bootstrap(
         Some(blob) => match vault.open_proto::<StoredSessionRecord>(&blob) {
             Ok(rec) => rec.self_profile.map(|profile| SavedSession {
                 server_addr: rec.server_addr,
+                server_pubkey_hex: rec.server_pubkey_hex,
                 self_profile: profile,
                 session_token: rec.session_token,
                 last_pts: rec.last_pts,
@@ -309,6 +312,7 @@ fn handle_save_session(
         self_profile: Some(sess.self_profile),
         session_token: sess.session_token,
         last_pts: sess.last_pts,
+        server_pubkey_hex: sess.server_pubkey_hex,
     };
     let blob = vault.seal_proto(&rec)?;
     conn.execute(

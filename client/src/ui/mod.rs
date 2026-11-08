@@ -45,6 +45,7 @@ pub enum Message {
 
     // Onboarding / Auth Screen
     AuthServerChanged(String),
+    AuthServerPubkeyChanged(String),
     AuthUsernameChanged(String),
     AuthPasswordChanged(String),
     AuthDisplayNameChanged(String),
@@ -91,6 +92,7 @@ pub struct TelegramApp {
     // Auth form state
     pub auth_mode_register: bool,
     pub auth_server_input: String,
+    pub auth_server_pubkey_input: String,
     pub auth_username_input: String,
     pub auth_password_input: String,
     pub auth_display_name_input: String,
@@ -139,6 +141,7 @@ pub struct TelegramApp {
 impl TelegramApp {
     pub fn new(config: ClientLaunchConfig) -> (Self, Task<Message>) {
         let server_default = config.default_server_addr.clone();
+        let pubkey_default = config.default_server_pubkey_hex.clone();
         let app = Self {
             config,
             handles: None,
@@ -147,6 +150,7 @@ impl TelegramApp {
 
             auth_mode_register: false,
             auth_server_input: server_default,
+            auth_server_pubkey_input: pubkey_default,
             auth_username_input: String::new(),
             auth_password_input: String::new(),
             auth_display_name_input: String::new(),
@@ -245,6 +249,11 @@ impl TelegramApp {
                 self.auth_error = None;
                 Task::none()
             }
+            Message::AuthServerPubkeyChanged(v) => {
+                self.auth_server_pubkey_input = v;
+                self.auth_error = None;
+                Task::none()
+            }
             Message::AuthUsernameChanged(v) => {
                 self.auth_username_input = v;
                 self.auth_error = None;
@@ -266,10 +275,18 @@ impl TelegramApp {
             }
             Message::SubmitAuth => {
                 let server_addr = self.auth_server_input.trim().to_owned();
+                let server_pubkey_hex = self.auth_server_pubkey_input.trim().to_owned();
                 let username = self.auth_username_input.trim().to_owned();
                 let password = self.auth_password_input.clone();
                 if server_addr.is_empty() || username.is_empty() || password.is_empty() {
                     self.auth_error = Some("Заполните адрес сервера, логин и пароль".to_owned());
+                    return Task::none();
+                }
+                if tgram_proto::parse_verifying_key_hex(&server_pubkey_hex).is_err() {
+                    self.auth_error = Some(
+                        "Укажите корректный публичный ключ сервера Ed25519 (64 HEX-символа из лога запуска tgram-server)"
+                            .to_owned(),
+                    );
                     return Task::none();
                 }
 
@@ -284,6 +301,7 @@ impl TelegramApp {
                     };
                     let _ = h.net_tx.send(NetCommand::ConnectAndAuth {
                         server_addr,
+                        server_pubkey_hex,
                         req: AuthRequest {
                             method: method as i32,
                             username,
@@ -729,25 +747,45 @@ impl TelegramApp {
                 }
 
                 if let Some(saved) = session {
-                    self.auth_server_input = saved.server_addr.clone();
-                    self.self_profile = Some(saved.self_profile.clone());
-                    self.users_by_id
-                        .insert(saved.self_profile.user_id, saved.self_profile);
-                    self.ingest_dialogs(dialogs);
+                    let resolved_pubkey = if !self.config.default_server_pubkey_hex.trim().is_empty()
+                    {
+                        self.config.default_server_pubkey_hex.trim().to_owned()
+                    } else {
+                        saved.server_pubkey_hex.trim().to_owned()
+                    };
 
-                    if let Some(ref h) = self.handles {
-                        let _ = h.net_tx.send(NetCommand::ConnectAndAuth {
-                            server_addr: saved.server_addr,
-                            req: AuthRequest {
-                                method: AuthMethod::TokenResume as i32,
-                                username: String::new(),
-                                password: String::new(),
-                                display_name: String::new(),
-                                session_token: saved.session_token,
-                                device_name: format!("TGram Desktop ({})", std::env::consts::OS),
-                                last_known_pts: saved.last_pts,
-                            },
-                        });
+                    self.auth_server_input = saved.server_addr.clone();
+                    if !resolved_pubkey.is_empty() {
+                        self.auth_server_pubkey_input = resolved_pubkey.clone();
+                    }
+
+                    if tgram_proto::parse_verifying_key_hex(&resolved_pubkey).is_ok() {
+                        self.self_profile = Some(saved.self_profile.clone());
+                        self.users_by_id
+                            .insert(saved.self_profile.user_id, saved.self_profile);
+                        self.ingest_dialogs(dialogs);
+
+                        if let Some(ref h) = self.handles {
+                            let _ = h.net_tx.send(NetCommand::ConnectAndAuth {
+                                server_addr: saved.server_addr,
+                                server_pubkey_hex: resolved_pubkey,
+                                req: AuthRequest {
+                                    method: AuthMethod::TokenResume as i32,
+                                    username: String::new(),
+                                    password: String::new(),
+                                    display_name: String::new(),
+                                    session_token: saved.session_token,
+                                    device_name: format!(
+                                        "TGram Desktop ({})",
+                                        std::env::consts::OS
+                                    ),
+                                    last_known_pts: saved.last_pts,
+                                },
+                            });
+                        }
+                    } else if let Some(ref h) = self.handles {
+                        // Legacy session without pinned server key: drop unverified token and require explicit pinning
+                        let _ = h.storage_tx.send(StorageCommand::ClearSession);
                     }
                 }
                 Task::none()
@@ -769,6 +807,7 @@ impl TelegramApp {
 
             BackendEvent::AuthSucceeded {
                 server_addr,
+                server_pubkey_hex,
                 profile,
                 ..
             } => {
@@ -776,6 +815,7 @@ impl TelegramApp {
                 self.auth_error = None;
                 self.auth_password_input.clear();
                 self.auth_server_input = server_addr;
+                self.auth_server_pubkey_input = server_pubkey_hex;
                 self.users_by_id.insert(profile.user_id, profile.clone());
                 self.self_profile = Some(profile);
                 Task::none()

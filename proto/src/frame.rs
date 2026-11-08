@@ -64,6 +64,15 @@ impl DecodedFrame {
     }
 }
 
+#[inline]
+fn compute_nonce_and_next_seq(iv_prefix: &[u8; 4], seq: u64) -> WireResult<([u8; 12], u64)> {
+    let next_seq = seq.checked_add(1).ok_or(WireError::SequenceOverflow)?;
+    let mut nonce = [0u8; 12];
+    nonce[0..4].copy_from_slice(iv_prefix);
+    nonce[4..12].copy_from_slice(&seq.to_le_bytes());
+    Ok((nonce, next_seq))
+}
+
 /// Write-half AEAD sealer (owned exclusively by socket writer task — zero mutexes).
 pub struct FrameSealer {
     cipher: ChaCha20Poly1305,
@@ -89,20 +98,8 @@ impl FrameSealer {
         }
     }
 
-    #[inline]
-    fn next_nonce(&mut self) -> WireResult<[u8; 12]> {
-        let current = self.seq;
-        self.seq = self
-            .seq
-            .checked_add(1)
-            .ok_or(WireError::SequenceOverflow)?;
-        let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&self.iv_prefix);
-        nonce[4..12].copy_from_slice(&current.to_le_bytes());
-        Ok(nonce)
-    }
-
     /// Encodes a Protobuf message directly into `dst` and encrypts it in-place (zero intermediate heap allocs).
+    /// Guarantees atomic sequence and buffer state: `self.seq` is incremented ONLY after encoding and AEAD succeed.
     pub fn seal_proto<M: Message>(
         &mut self,
         opcode: Opcode,
@@ -119,6 +116,8 @@ impl FrameSealer {
             ));
         }
 
+        let (mut nonce, next_seq) = compute_nonce_and_next_seq(&self.iv_prefix, self.seq)?;
+
         let header = FrameHeader {
             payload_len: payload_len as u32,
             opcode,
@@ -126,25 +125,46 @@ impl FrameSealer {
             req_id,
         };
         let aad = header.encode();
-        let nonce = self.next_nonce()?;
 
         let start = dst.len();
         dst.reserve(FRAME_HEADER_LEN + payload_len + AEAD_TAG_LEN);
         dst.extend_from_slice(&aad);
-        msg.encode(dst)?;
+        if let Err(err) = msg.encode(dst) {
+            dst.truncate(start);
+            nonce.zeroize();
+            return Err(err.into());
+        }
+
+        let actual_payload_len = dst.len() - (start + FRAME_HEADER_LEN);
+        if actual_payload_len != payload_len {
+            dst.truncate(start);
+            nonce.zeroize();
+            return Err(WireError::AeadTampered);
+        }
 
         let payload_slice =
             &mut dst[start + FRAME_HEADER_LEN..start + FRAME_HEADER_LEN + payload_len];
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, payload_slice)
-            .map_err(|_| WireError::AeadTampered)?;
+        let tag = match self.cipher.encrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            &aad,
+            payload_slice,
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                dst.truncate(start);
+                nonce.zeroize();
+                return Err(WireError::AeadTampered);
+            }
+        };
 
+        nonce.zeroize();
         dst.extend_from_slice(tag.as_slice());
+        self.seq = next_seq;
         Ok(())
     }
 
     /// Seals pre-encoded Protobuf payload bytes into `dst` (useful for fanout of pre-serialized updates).
+    /// Guarantees atomic sequence and buffer state: `self.seq` is incremented ONLY after AEAD succeeds.
     pub fn seal_raw(
         &mut self,
         opcode: Opcode,
@@ -160,6 +180,8 @@ impl FrameSealer {
             ));
         }
 
+        let (mut nonce, next_seq) = compute_nonce_and_next_seq(&self.iv_prefix, self.seq)?;
+
         let header = FrameHeader {
             payload_len: plaintext.len() as u32,
             opcode,
@@ -167,7 +189,6 @@ impl FrameSealer {
             req_id,
         };
         let aad = header.encode();
-        let nonce = self.next_nonce()?;
 
         let start = dst.len();
         dst.reserve(FRAME_HEADER_LEN + plaintext.len() + AEAD_TAG_LEN);
@@ -176,18 +197,33 @@ impl FrameSealer {
 
         let payload_slice =
             &mut dst[start + FRAME_HEADER_LEN..start + FRAME_HEADER_LEN + plaintext.len()];
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, payload_slice)
-            .map_err(|_| WireError::AeadTampered)?;
+        let tag = match self.cipher.encrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            &aad,
+            payload_slice,
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                dst.truncate(start);
+                nonce.zeroize();
+                return Err(WireError::AeadTampered);
+            }
+        };
 
+        nonce.zeroize();
         dst.extend_from_slice(tag.as_slice());
+        self.seq = next_seq;
         Ok(())
     }
 
     #[inline]
     pub fn sequence(&self) -> u64 {
         self.seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sequence_for_test(&mut self, seq: u64) {
+        self.seq = seq;
     }
 }
 
@@ -216,19 +252,6 @@ impl FrameOpener {
         }
     }
 
-    #[inline]
-    fn next_nonce(&mut self) -> WireResult<[u8; 12]> {
-        let current = self.seq;
-        self.seq = self
-            .seq
-            .checked_add(1)
-            .ok_or(WireError::SequenceOverflow)?;
-        let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&self.iv_prefix);
-        nonce[4..12].copy_from_slice(&current.to_le_bytes());
-        Ok(nonce)
-    }
-
     /// Attempts to extract and authenticate one complete frame from `rx_buf`.
     /// Returns `Ok(None)` if more bytes must be read from the socket.
     pub fn try_open_next(&mut self, rx_buf: &mut BytesMut) -> WireResult<Option<DecodedFrame>> {
@@ -247,20 +270,22 @@ impl FrameOpener {
             return Ok(None);
         }
 
+        let (mut nonce, next_seq) = compute_nonce_and_next_seq(&self.iv_prefix, self.seq)?;
+
         let mut frame_buf = rx_buf.split_to(total_len);
         frame_buf.advance(FRAME_HEADER_LEN);
         let tag_buf = frame_buf.split_off(payload_len);
 
-        let nonce = self.next_nonce()?;
-        self.cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &aad,
-                &mut frame_buf[..],
-                Tag::from_slice(&tag_buf),
-            )
-            .map_err(|_| WireError::AeadTampered)?;
+        let decrypt_res = self.cipher.decrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            &aad,
+            &mut frame_buf[..],
+            Tag::from_slice(&tag_buf),
+        );
+        nonce.zeroize();
+        decrypt_res.map_err(|_| WireError::AeadTampered)?;
 
+        self.seq = next_seq;
         Ok(Some(DecodedFrame {
             header,
             payload: frame_buf.freeze(),
@@ -270,5 +295,10 @@ impl FrameOpener {
     #[inline]
     pub fn sequence(&self) -> u64 {
         self.seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sequence_for_test(&mut self, seq: u64) {
+        self.seq = seq;
     }
 }

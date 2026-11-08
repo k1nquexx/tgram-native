@@ -212,12 +212,23 @@ impl RealtimeHub {
         let media = if req.media_id.trim().is_empty() {
             None
         } else {
-            let attachment = self
-                .media
-                .get_attachment(req.media_id.trim())
-                .ok_or_else(|| {
-                    ServerError::BadRequest(format!("unknown media_id '{}'", req.media_id))
-                })?;
+            let mid = req.media_id.trim();
+            MediaManager::validate_media_id(mid)?;
+            if !self.store.user_has_access_to_media(sender_id, mid).await? {
+                return Err(ServerError::Unauthorized);
+            }
+            let attachment = match self.media.get_attachment(mid) {
+                Some(a) => a,
+                None => {
+                    let loaded = self
+                        .store
+                        .get_media_attachment(mid)
+                        .await?
+                        .ok_or_else(|| ServerError::BadRequest(format!("unknown media_id '{mid}'")))?;
+                    self.media.register_existing(loaded.clone());
+                    loaded
+                }
+            };
             Some(attachment)
         };
 

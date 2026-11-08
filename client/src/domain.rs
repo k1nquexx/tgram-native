@@ -14,6 +14,7 @@ use tgram_proto::{
 pub struct ClientLaunchConfig {
     pub profile_name: String,
     pub default_server_addr: String,
+    pub default_server_pubkey_hex: String,
     pub db_path: PathBuf,
     pub downloads_dir: PathBuf,
 }
@@ -23,6 +24,10 @@ impl ClientLaunchConfig {
         let mut profile_name = std::env::var("TGRAM_PROFILE").unwrap_or_else(|_| "default".into());
         let mut default_server_addr =
             std::env::var("TGRAM_SERVER").unwrap_or_else(|_| "127.0.0.1:4430".into());
+        let mut default_server_pubkey_hex = std::env::var("TGRAM_SERVER_PUBKEY_HEX")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -45,6 +50,13 @@ impl ClientLaunchConfig {
                         }
                     }
                 }
+                "--server-pubkey" | "-k" => {
+                    if let Some(val) = args.next() {
+                        if !val.trim().is_empty() {
+                            default_server_pubkey_hex = val.trim().to_owned();
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -56,6 +68,7 @@ impl ClientLaunchConfig {
         Self {
             profile_name,
             default_server_addr,
+            default_server_pubkey_hex,
             db_path,
             downloads_dir,
         }
@@ -88,6 +101,7 @@ impl ConnectionState {
 #[derive(Debug, Clone)]
 pub struct SavedSession {
     pub server_addr: String,
+    pub server_pubkey_hex: String,
     pub self_profile: UserProfile,
     pub session_token: Vec<u8>,
     pub last_pts: u64,
@@ -210,6 +224,7 @@ pub enum StorageCommand {
 pub enum NetCommand {
     ConnectAndAuth {
         server_addr: String,
+        server_pubkey_hex: String,
         req: AuthRequest,
     },
     LogoutAndDisconnect,
@@ -269,6 +284,7 @@ pub enum BackendEvent {
     ConnectionChanged(ConnectionState),
     AuthSucceeded {
         server_addr: String,
+        server_pubkey_hex: String,
         profile: UserProfile,
         session_token: Vec<u8>,
         current_pts: u64,

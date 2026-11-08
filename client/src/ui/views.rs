@@ -107,7 +107,7 @@ fn render_auth_screen(app: &TelegramApp) -> Element<'_, Message> {
     let subtitle_str = if app.auth_mode_register {
         "Зарегистрируйтесь для мгновенного защищённого общения"
     } else {
-        "Введите адрес сервера MTWire, логин и пароль"
+        "Введите адрес сервера, ключ Ed25519, логин и пароль"
     };
 
     let status_color = match app.conn_state {
@@ -124,6 +124,20 @@ fn render_auth_screen(app: &TelegramApp) -> Element<'_, Message> {
             .padding([10, 12])
             .size(14)
             .style(auth_input_style),
+    ]
+    .spacing(5);
+
+    let pubkey_field = column![
+        txt("Публичный ключ сервера Ed25519 (64 HEX)").size(12).color(TEXT_SUB),
+        text_input(
+            "ed25519_pubkey из лога запуска сервера",
+            &app.auth_server_pubkey_input
+        )
+        .on_input(Message::AuthServerPubkeyChanged)
+        .on_submit(Message::SubmitAuth)
+        .padding([10, 12])
+        .size(13)
+        .style(auth_input_style),
     ]
     .spacing(5);
 
@@ -158,6 +172,7 @@ fn render_auth_screen(app: &TelegramApp) -> Element<'_, Message> {
             .center_x(Length::Fill),
         v_spacer(4.0),
         server_field,
+        pubkey_field,
         username_field,
         password_field,
     ]

@@ -182,12 +182,31 @@ impl StorageEngine {
 
     pub async fn save_media_metadata(
         &self,
+        uploader_user_id: u64,
         media: &MediaAttachment,
         now_ms: i64,
     ) -> ServerResult<()> {
         match self {
-            Self::Memory(s) => s.save_media_metadata(media, now_ms).await,
-            Self::Postgres(s) => s.save_media_metadata(media, now_ms).await,
+            Self::Memory(s) => s.save_media_metadata(uploader_user_id, media, now_ms).await,
+            Self::Postgres(s) => s.save_media_metadata(uploader_user_id, media, now_ms).await,
+        }
+    }
+
+    pub async fn get_media_attachment(&self, media_id: &str) -> ServerResult<Option<MediaAttachment>> {
+        match self {
+            Self::Memory(s) => s.get_media_attachment(media_id).await,
+            Self::Postgres(s) => s.get_media_attachment(media_id).await,
+        }
+    }
+
+    pub async fn user_has_access_to_media(
+        &self,
+        user_id: u64,
+        media_id: &str,
+    ) -> ServerResult<bool> {
+        match self {
+            Self::Memory(s) => s.user_has_access_to_media(user_id, media_id).await,
+            Self::Postgres(s) => s.user_has_access_to_media(user_id, media_id).await,
         }
     }
 }

@@ -20,6 +20,7 @@ use tgram_proto::{
 use crate::config::ServerConfig;
 use crate::error::{ServerError, ServerResult};
 use crate::hub::{OutboundPacket, RealtimeHub, SESSION_OUTBOX_CAPACITY};
+use crate::media::MediaManager;
 use crate::store::unix_millis_now;
 
 struct AuthenticatedContext {
@@ -402,16 +403,32 @@ async fn dispatch_frame(
             let (ack, completed) = hub.media.append_chunk(uid, req).await?;
             if let Some(ref attachment) = completed {
                 hub.store
-                    .save_media_metadata(attachment, unix_millis_now())
+                    .save_media_metadata(uid, attachment, unix_millis_now())
                     .await?;
             }
             enqueue_reply(outbound_tx, Opcode::UploadChunkAck, req_id, &ack).await
         }
 
         Opcode::DownloadChunkReq => {
-            let _uid = require_uid(auth_ctx)?;
+            let uid = require_uid(auth_ctx)?;
             let req: MediaDownloadChunkRequest = frame.decode_proto()?;
-            let res = hub.media.read_chunk(req).await?;
+            MediaManager::validate_media_id(&req.media_id)?;
+            if !hub.store.user_has_access_to_media(uid, &req.media_id).await? {
+                return Err(ServerError::Unauthorized);
+            }
+            let meta = match hub.media.get_attachment(&req.media_id) {
+                Some(m) => m,
+                None => {
+                    let loaded = hub
+                        .store
+                        .get_media_attachment(&req.media_id)
+                        .await?
+                        .ok_or_else(|| ServerError::BadRequest("media_id not found".to_owned()))?;
+                    hub.media.register_existing(loaded.clone());
+                    loaded
+                }
+            };
+            let res = hub.media.read_chunk_with_meta(req, &meta).await?;
             enqueue_reply(outbound_tx, Opcode::DownloadChunkRes, req_id, &res).await
         }
 

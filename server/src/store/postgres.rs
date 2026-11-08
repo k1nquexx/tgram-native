@@ -1009,15 +1009,19 @@ impl PostgresStore {
 
     pub async fn save_media_metadata(
         &self,
+        uploader_user_id: u64,
         media: &MediaAttachment,
         now_ms: i64,
     ) -> ServerResult<()> {
         sqlx::query(
-            "INSERT INTO media_objects (media_id, file_name, mime_type, size_bytes, sha256_hash, width, height, created_at_ms)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "INSERT INTO media_objects (
+                 media_id, uploader_user_id, file_name, mime_type, size_bytes, sha256_hash, width, height, created_at_ms
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (media_id) DO NOTHING",
         )
         .bind(&media.media_id)
+        .bind(uploader_user_id as i64)
         .bind(&media.file_name)
         .bind(&media.mime_type)
         .bind(media.size_bytes as i64)
@@ -1029,6 +1033,58 @@ impl PostgresStore {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    pub async fn get_media_attachment(&self, media_id: &str) -> ServerResult<Option<MediaAttachment>> {
+        let row = sqlx::query(
+            "SELECT media_id, file_name, mime_type, size_bytes, sha256_hash, width, height
+             FROM media_objects
+             WHERE media_id = $1",
+        )
+        .bind(media_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(MediaAttachment {
+            media_id: r.try_get("media_id").map_err(db_err)?,
+            file_name: r.try_get("file_name").map_err(db_err)?,
+            mime_type: r.try_get("mime_type").map_err(db_err)?,
+            size_bytes: r.try_get::<i64, _>("size_bytes").map_err(db_err)? as u64,
+            sha256_hash: r.try_get("sha256_hash").map_err(db_err)?,
+            width: r.try_get::<i32, _>("width").map_err(db_err)? as u32,
+            height: r.try_get::<i32, _>("height").map_err(db_err)? as u32,
+        }))
+    }
+
+    pub async fn user_has_access_to_media(
+        &self,
+        user_id: u64,
+        media_id: &str,
+    ) -> ServerResult<bool> {
+        let allowed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM media_objects mo
+                 WHERE mo.media_id = $1 AND mo.uploader_user_id = $2
+             ) OR EXISTS (
+                 SELECT 1
+                 FROM messages m
+                 INNER JOIN chat_members cm ON cm.chat_id = m.chat_id
+                 WHERE m.media_id = $1 AND cm.user_id = $2
+             )",
+        )
+        .bind(media_id)
+        .bind(user_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(allowed)
     }
 
     async fn fetch_latest_message(
