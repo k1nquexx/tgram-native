@@ -14,12 +14,13 @@ use crate::ui::canvas_widgets::{
     DIALOG_ROW_HEIGHT, FONT_BOLD,
 };
 use crate::ui::theme::{
-    auth_input_style, card_container, chat_view_container, composer_editor_style, hairline_divider,
-    pill_chip_container, primary_button_style, rgba8, search_input_style, sidebar_container,
-    subtle_icon_button_style, thin_dark_scrollable_style, transparent_row_button_style, ACCENT,
-    ACCENT_TEXT, BG_INPUT, BG_PANEL, DANGER, ONLINE_DOT, TEXT_MAIN, TEXT_SUB,
+    accent_bar_container, auth_input_style, card_container, chat_view_container,
+    composer_editor_style, hairline_divider, pill_chip_container, primary_button_style, rgba8,
+    search_input_style, sidebar_container, subtle_icon_button_style, thin_dark_scrollable_style,
+    transparent_row_button_style, ACCENT, ACCENT_TEXT, BG_INPUT, BG_PANEL, DANGER, ONLINE_DOT,
+    TEXT_MAIN, TEXT_SUB,
 };
-use crate::ui::{Message, TelegramApp};
+use crate::ui::{ContextMenuState, Message, TelegramApp};
 
 #[inline]
 fn txt<'a>(content: impl text::IntoFragment<'a>) -> Text<'a> {
@@ -105,9 +106,9 @@ fn render_auth_screen(app: &TelegramApp) -> Element<'_, Message> {
     };
 
     let subtitle_str = if app.auth_mode_register {
-        "Зарегистрируйтесь для мгновенного защищённого общения"
+        "Придумайте логин, пароль и имя"
     } else {
-        "Введите адрес сервера, ключ Ed25519, логин и пароль"
+        "Введите логин и пароль"
     };
 
     let status_color = match app.conn_state {
@@ -115,31 +116,6 @@ fn render_auth_screen(app: &TelegramApp) -> Element<'_, Message> {
         ConnectionState::Disconnected => TEXT_SUB,
         _ => ACCENT_TEXT,
     };
-
-    let server_field = column![
-        txt("Сервер MTWire (TCP)").size(12).color(TEXT_SUB),
-        text_input("127.0.0.1:4430", &app.auth_server_input)
-            .on_input(Message::AuthServerChanged)
-            .on_submit(Message::SubmitAuth)
-            .padding([10, 12])
-            .size(14)
-            .style(auth_input_style),
-    ]
-    .spacing(5);
-
-    let pubkey_field = column![
-        txt("Публичный ключ сервера Ed25519 (64 HEX)").size(12).color(TEXT_SUB),
-        text_input(
-            "ed25519_pubkey из лога запуска сервера",
-            &app.auth_server_pubkey_input
-        )
-        .on_input(Message::AuthServerPubkeyChanged)
-        .on_submit(Message::SubmitAuth)
-        .padding([10, 12])
-        .size(13)
-        .style(auth_input_style),
-    ]
-    .spacing(5);
 
     let username_field = column![
         txt("Имя пользователя (@username)").size(12).color(TEXT_SUB),
@@ -170,13 +146,11 @@ fn render_auth_screen(app: &TelegramApp) -> Element<'_, Message> {
         container(txt(subtitle_str).size(13).color(TEXT_SUB)).center_x(Length::Fill),
         container(txt(app.conn_state.label_ru()).size(12).color(status_color))
             .center_x(Length::Fill),
-        v_spacer(4.0),
-        server_field,
-        pubkey_field,
+        v_spacer(6.0),
         username_field,
         password_field,
     ]
-    .spacing(10)
+    .spacing(12)
     .width(Length::Fill);
 
     if app.auth_mode_register {
@@ -652,6 +626,63 @@ fn render_center_chat_panel(app: &TelegramApp) -> Element<'_, Message> {
 
     root_col = root_col.push(chat_header).push(h_divider());
 
+    // 1B. Pinned Message Banner right under chat_header (`Блок D-1.5`)
+    if let Some(pinned_msg) = app.pinned_message_by_chat.get(&chat_id) {
+        let pin_snippet = if !pinned_msg.text.trim().is_empty() {
+            pinned_msg
+                .text
+                .chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .take(88)
+                .collect::<String>()
+        } else if let Some(ref med) = pinned_msg.media {
+            format!("📎 {}", med.attachment.file_name)
+        } else {
+            format!("Сообщение #{}", pinned_msg.msg_id)
+        };
+
+        let jump_pin_btn = button(
+            row![
+                container(column![])
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(28.0))
+                    .style(accent_bar_container),
+                column![
+                    txt("📌 Закреплённое сообщение")
+                        .size(11.5)
+                        .font(FONT_BOLD)
+                        .color(ACCENT_TEXT),
+                    txt(pin_snippet).size(12.5).color(TEXT_MAIN),
+                ]
+                .spacing(1),
+            ]
+            .spacing(10)
+            .align_y(Vertical::Center)
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .padding([4, 6])
+        .style(transparent_row_button_style)
+        .on_press(Message::JumpToMessage(pinned_msg.msg_id));
+
+        let pinned_banner = container(
+            row![
+                jump_pin_btn,
+                button(txt("✕").size(13).color(TEXT_SUB))
+                    .padding([4, 8])
+                    .style(subtle_icon_button_style)
+                    .on_press(Message::UnpinChatMessage(chat_id)),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center)
+            .padding([4, 14]),
+        )
+        .width(Length::Fill)
+        .style(sidebar_container);
+
+        root_col = root_col.push(pinned_banner).push(h_divider());
+    }
+
     // 2. Optional In-Chat Message Filter Bar
     if app.show_chat_search {
         let hits = app.active_layout.indices.len();
@@ -677,7 +708,159 @@ fn render_center_chat_panel(app: &TelegramApp) -> Element<'_, Message> {
 
     // 3. O(log N) Prefix-Sum Virtualized Message Bubble Feed
     let history_feed = render_virtualized_history(app, chat_id, peer_type);
-    root_col = root_col.push(history_feed).push(h_divider());
+    root_col = root_col.push(history_feed);
+
+    // 3B. Floating Scroll-to-Bottom Pill with Unread Badge when scrolled up
+    if !app.history_near_bottom {
+        let jump_label = if app.unread_while_scrolled > 0 {
+            format!("↓ К новым сообщениям ({})", app.unread_while_scrolled)
+        } else {
+            "↓ В конец истории".to_owned()
+        };
+        let jump_btn = button(txt(jump_label).size(12.5).font(FONT_BOLD).color(TEXT_MAIN))
+            .padding([5, 14])
+            .style(primary_button_style)
+            .on_press(Message::ScrollHistoryToBottom);
+        let jump_strip = container(row![h_fill(), jump_btn].padding([4, 16])).width(Length::Fill);
+        root_col = root_col.push(jump_strip);
+    }
+
+    root_col = root_col.push(h_divider());
+
+    if let Some(ref reply_msg) = app.reply_target {
+        let preview_snippet = if !reply_msg.text.trim().is_empty() {
+            reply_msg.text.chars().take(72).collect::<String>()
+        } else if let Some(ref med) = reply_msg.media {
+            format!("📎 {}", med.attachment.file_name)
+        } else {
+            format!("Сообщение #{}", reply_msg.msg_id)
+        };
+
+        let jump_quote_btn = button(
+            row![
+                container(column![])
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(30.0))
+                    .style(accent_bar_container),
+                column![
+                    txt(format!("Ответ {}", reply_msg.sender_name))
+                        .size(12)
+                        .font(FONT_BOLD)
+                        .color(ACCENT_TEXT),
+                    txt(preview_snippet).size(12).color(TEXT_MAIN),
+                ]
+                .spacing(1),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        )
+        .padding([2, 6])
+        .style(transparent_row_button_style)
+        .on_press(Message::JumpToMessage(reply_msg.msg_id));
+
+        let reply_strip = container(
+            row![
+                jump_quote_btn,
+                h_fill(),
+                button(txt("✕").size(13).color(TEXT_SUB))
+                    .padding([4, 8])
+                    .style(subtle_icon_button_style)
+                    .on_press(Message::ClearReplyTarget),
+            ]
+            .align_y(Vertical::Center)
+            .padding([4, 12]),
+        )
+        .width(Length::Fill)
+        .style(sidebar_container);
+
+        root_col = root_col.push(reply_strip).push(h_divider());
+    }
+
+    if let Some((_, ref edit_msg)) = app.editing_target {
+        let edit_snippet = if !edit_msg.text.trim().is_empty() {
+            edit_msg.text.chars().take(72).collect::<String>()
+        } else {
+            format!("Сообщение #{}", edit_msg.msg_id)
+        };
+
+        let jump_edit_btn = button(
+            row![
+                container(column![])
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(30.0))
+                    .style(accent_bar_container),
+                column![
+                    txt("✏ Редактирование")
+                        .size(12)
+                        .font(FONT_BOLD)
+                        .color(ACCENT_TEXT),
+                    txt(edit_snippet).size(12).color(TEXT_MAIN),
+                ]
+                .spacing(1),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        )
+        .padding([2, 6])
+        .style(transparent_row_button_style)
+        .on_press(Message::JumpToMessage(edit_msg.msg_id));
+
+        let edit_strip = container(
+            row![
+                jump_edit_btn,
+                h_fill(),
+                button(txt("✕").size(13).color(TEXT_SUB))
+                    .padding([4, 8])
+                    .style(subtle_icon_button_style)
+                    .on_press(Message::ClearReplyTarget),
+            ]
+            .align_y(Vertical::Center)
+            .padding([4, 12]),
+        )
+        .width(Length::Fill)
+        .style(sidebar_container);
+
+        root_col = root_col.push(edit_strip).push(h_divider());
+    }
+
+    if let Some(ref fwd_msg) = app.forward_source {
+        let fwd_snippet = if !fwd_msg.text.trim().is_empty() {
+            fwd_msg.text.chars().take(72).collect::<String>()
+        } else if let Some(ref med) = fwd_msg.media {
+            format!("📎 {}", med.attachment.file_name)
+        } else {
+            format!("Сообщение #{}", fwd_msg.msg_id)
+        };
+
+        let fwd_strip = container(
+            row![
+                container(column![])
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(30.0))
+                    .style(accent_bar_container),
+                column![
+                    txt(format!("↪ Переслать от {}", fwd_msg.sender_name))
+                        .size(12)
+                        .font(FONT_BOLD)
+                        .color(ACCENT_TEXT),
+                    txt(fwd_snippet).size(12).color(TEXT_MAIN),
+                ]
+                .spacing(1),
+                h_fill(),
+                button(txt("✕").size(13).color(TEXT_SUB))
+                    .padding([4, 8])
+                    .style(subtle_icon_button_style)
+                    .on_press(Message::ClearReplyTarget),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center)
+            .padding([4, 12]),
+        )
+        .width(Length::Fill)
+        .style(sidebar_container);
+
+        root_col = root_col.push(fwd_strip).push(h_divider());
+    }
 
     // 4. Bottom Auto-Expanding Multi-Line Composer (#17212b)
     let composer_bar = render_composer_bar(app);
@@ -781,11 +964,50 @@ fn render_virtualized_history(
 
         if ui_msg.media.is_some() {
             let interactive_bubble = mouse_area(bubble_canvas)
+                .on_enter(Message::HoverMessageBubble(Some((chat_id, msg_idx))))
                 .on_press(Message::MediaBubbleClicked { chat_id, msg_idx })
+                .on_right_press(Message::OpenMessageContextMenu { chat_id, msg_idx })
+                .interaction(mouse::Interaction::Pointer);
+            feed_col = feed_col.push(interactive_bubble);
+        } else if ui_msg.reply_to_msg_id > 0 {
+            let interactive_bubble = mouse_area(bubble_canvas)
+                .on_enter(Message::HoverMessageBubble(Some((chat_id, msg_idx))))
+                .on_press(Message::JumpToMessage(ui_msg.reply_to_msg_id))
+                .on_right_press(Message::OpenMessageContextMenu { chat_id, msg_idx })
                 .interaction(mouse::Interaction::Pointer);
             feed_col = feed_col.push(interactive_bubble);
         } else {
-            feed_col = feed_col.push(bubble_canvas);
+            let interactive_bubble = mouse_area(bubble_canvas)
+                .on_enter(Message::HoverMessageBubble(Some((chat_id, msg_idx))))
+                .on_right_press(Message::OpenMessageContextMenu { chat_id, msg_idx });
+            feed_col = feed_col.push(interactive_bubble);
+        }
+
+        let is_ctx_open = app
+            .context_menu
+            .as_ref()
+            .map(|cm| cm.chat_id == chat_id && cm.msg_idx == msg_idx)
+            .unwrap_or(false);
+
+        if is_ctx_open {
+            if let Some(ref cm) = app.context_menu {
+                let is_pinned = app
+                    .pinned_message_by_chat
+                    .get(&chat_id)
+                    .map(|p| {
+                        (ui_msg.msg_id > 0 && p.msg_id == ui_msg.msg_id)
+                            || (ui_msg.client_random_id != 0
+                                && p.client_random_id == ui_msg.client_random_id)
+                    })
+                    .unwrap_or(false);
+                feed_col = feed_col.push(render_message_context_menu(cm, is_pinned));
+            }
+        } else if app.hovered_msg_idx == Some((chat_id, msg_idx)) {
+            feed_col = feed_col.push(render_quick_reaction_bar(
+                chat_id,
+                msg_idx,
+                ui_msg.is_outgoing,
+            ));
         }
     }
 
@@ -800,6 +1022,110 @@ fn render_virtualized_history(
         .style(thin_dark_scrollable_style)
         .on_scroll(Message::HistoryScrolled)
         .into()
+}
+
+fn render_quick_reaction_bar(
+    chat_id: u64,
+    msg_idx: usize,
+    is_outgoing: bool,
+) -> Element<'static, Message> {
+    const QUICK_EMOJIS: [&str; 5] = ["👍", "❤️", "🔥", "😂", "🎉"];
+    let mut emoji_row = row![].spacing(4).padding([2, 8]);
+    for emoji in QUICK_EMOJIS {
+        let btn = button(txt(emoji).size(14))
+            .padding([3, 7])
+            .style(subtle_icon_button_style)
+            .on_press(Message::ToggleMessageReaction {
+                chat_id,
+                msg_idx,
+                emoji: emoji.to_owned(),
+            });
+        emoji_row = emoji_row.push(btn);
+    }
+
+    let pill = container(emoji_row).style(pill_chip_container);
+    let aligned = if is_outgoing {
+        row![h_fill(), pill].padding([2, 18])
+    } else {
+        row![pill, h_fill()].padding([2, 18])
+    };
+    container(aligned).width(Length::Fill).into()
+}
+
+fn render_message_context_menu(
+    cm: &ContextMenuState,
+    is_pinned: bool,
+) -> Element<'_, Message> {
+    const QUICK_EMOJIS: [&str; 5] = ["👍", "❤️", "🔥", "😂", "🎉"];
+    let mut quick_row = row![].spacing(4).padding([4, 6]);
+    for emoji in QUICK_EMOJIS {
+        let btn = button(txt(emoji).size(15))
+            .padding([4, 8])
+            .style(subtle_icon_button_style)
+            .on_press(Message::ToggleMessageReaction {
+                chat_id: cm.chat_id,
+                msg_idx: cm.msg_idx,
+                emoji: emoji.to_owned(),
+            });
+        quick_row = quick_row.push(btn);
+    }
+
+    let menu_item = |label: &'static str, msg: Message, color: iced::Color| -> Element<'_, Message> {
+        button(txt(label).size(13).color(color))
+            .width(Length::Fixed(220.0))
+            .padding([7, 12])
+            .style(subtle_icon_button_style)
+            .on_press(msg)
+            .into()
+    };
+
+    let mut items_col = Column::new().spacing(2).padding(6);
+    items_col = items_col.push(quick_row).push(h_divider());
+    items_col = items_col.push(menu_item("↩  Ответить", Message::ContextMenuReply, TEXT_MAIN));
+    if !cm.text.is_empty() {
+        items_col = items_col.push(menu_item(
+            "📋  Копировать текст",
+            Message::ContextMenuCopyText,
+            TEXT_MAIN,
+        ));
+    }
+    if cm.is_outgoing {
+        items_col = items_col.push(menu_item(
+            "✏  Изменить",
+            Message::ContextMenuEdit,
+            TEXT_MAIN,
+        ));
+    }
+    let pin_label = if is_pinned {
+        "📌  Открепить"
+    } else {
+        "📌  Закрепить"
+    };
+    items_col = items_col.push(menu_item(pin_label, Message::ContextMenuPin, TEXT_MAIN));
+    items_col = items_col.push(menu_item(
+        "↪  Переслать",
+        Message::ContextMenuForward,
+        TEXT_MAIN,
+    ));
+    items_col = items_col.push(h_divider());
+    items_col = items_col.push(menu_item("🗑  Удалить", Message::ContextMenuDelete, DANGER));
+    items_col = items_col.push(menu_item(
+        "✕  Закрыть",
+        Message::CloseContextMenu,
+        TEXT_SUB,
+    ));
+
+    let menu_card = container(items_col)
+        .width(Length::Fixed(232.0))
+        .style(card_container);
+
+    let aligned_row = if cm.is_outgoing {
+        row![h_fill(), menu_card].padding([4, 18])
+    } else {
+        row![menu_card, h_fill()].padding([4, 18])
+    };
+
+    container(aligned_row).width(Length::Fill).into()
 }
 
 fn render_composer_bar(app: &TelegramApp) -> Element<'_, Message> {

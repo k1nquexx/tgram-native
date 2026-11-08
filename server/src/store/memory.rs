@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 use tgram_proto::{
     AuthMethod, AuthRequest, ChatMessage, CreateDirectChatResponse, DialogEntry,
-    GetHistoryResponse, MediaAttachment, PeerType, SearchPeersResponse, SendMessageRequest,
-    SyncDialogsResponse, UserOnlineState, UserProfile,
+    GetHistoryResponse, MediaAttachment, PeerType, PushProvider, RegisterPushTokenRequest,
+    SearchPeersResponse, SendMessageRequest, SyncDialogsResponse, UserOnlineState, UserProfile,
 };
 
 use crate::auth::{
@@ -13,7 +13,7 @@ use crate::auth::{
 };
 use crate::error::{ServerError, ServerResult};
 use crate::store::{
-    unix_millis_now, AuthSessionOutcome, MarkReadOutcome, PersistMessageOutcome,
+    unix_millis_now, AuthSessionOutcome, MarkReadOutcome, PersistMessageOutcome, PushDeviceRecord,
     RecipientDeliveryTarget,
 };
 
@@ -83,6 +83,7 @@ struct MemoryState {
     direct_pairs: HashMap<(u64, u64), u64>,
     idempotency: HashMap<(u64, u64, u64), u64>, // (chat_id, sender_id, client_random_id) -> msg_id
     media: HashMap<String, StoredMediaObject>,
+    push_devices: HashMap<String, PushDeviceRecord>, // device_token -> PushDeviceRecord
 }
 
 pub struct MemoryStore {
@@ -161,6 +162,7 @@ impl MemoryStore {
                 direct_pairs: HashMap::new(),
                 idempotency: HashMap::new(),
                 media: HashMap::new(),
+                push_devices: HashMap::new(),
             }),
             seed_demo,
         }
@@ -343,7 +345,11 @@ impl MemoryStore {
 
     pub async fn revoke_session(&self, token_sha256: &[u8; 32]) -> ServerResult<bool> {
         let mut guard = self.state.write().await;
-        Ok(guard.sessions.remove(token_sha256).is_some())
+        let removed = guard.sessions.remove(token_sha256).is_some();
+        guard
+            .push_devices
+            .retain(|_, dev| &dev.token_sha256 != token_sha256);
+        Ok(removed)
     }
 
     pub async fn set_presence(
@@ -799,7 +805,7 @@ impl MemoryStore {
     ) -> ServerResult<MarkReadOutcome> {
         let mut guard = self.state.write().await;
 
-        let (effective_max, unread_count, peer_ids) = {
+        let (effective_max, advanced_inbox, unread_count, peer_ids) = {
             let chat = guard
                 .chats
                 .get_mut(&chat_id)
@@ -813,29 +819,32 @@ impl MemoryStore {
 
             let prev_inbox = chat.members[&reader_id].read_inbox_max_msg_id;
             let effective = prev_inbox.max(clamped);
+            let advanced = effective > prev_inbox;
 
-            if let Some(m) = chat.members.get_mut(&reader_id) {
-                m.read_inbox_max_msg_id = effective;
+            if advanced {
+                if let Some(m) = chat.members.get_mut(&reader_id) {
+                    m.read_inbox_max_msg_id = effective;
+                }
             }
 
             let mut peers = Vec::new();
-            if effective > prev_inbox {
+            if advanced {
                 for (&uid, m) in chat.members.iter_mut() {
-                    if uid != reader_id && uid != SYSTEM_USER_ID {
-                        if effective > m.read_outbox_max_msg_id {
-                            m.read_outbox_max_msg_id = effective;
-                        }
+                    if uid != reader_id && uid != SYSTEM_USER_ID && effective > m.read_outbox_max_msg_id {
+                        m.read_outbox_max_msg_id = effective;
                         peers.push(uid);
                     }
                 }
             }
 
             let remaining = count_unread_for_member(&chat.messages, reader_id, effective);
-            (effective, remaining, peers)
+            (effective, advanced, remaining, peers)
         };
 
         let reader_pts = if let Some(u) = guard.users.get_mut(&reader_id) {
-            u.current_pts += 1;
+            if advanced_inbox {
+                u.current_pts += 1;
+            }
             u.current_pts
         } else {
             1
@@ -924,6 +933,81 @@ impl MemoryStore {
         }
 
         Ok(false)
+    }
+
+    pub async fn register_push_device(
+        &self,
+        user_id: u64,
+        token_sha256: [u8; 32],
+        req: RegisterPushTokenRequest,
+        now_ms: i64,
+    ) -> ServerResult<PushDeviceRecord> {
+        let provider = PushProvider::try_from(req.provider).unwrap_or(PushProvider::Unspecified);
+        if !matches!(provider, PushProvider::Fcm | PushProvider::Apns) {
+            return Err(ServerError::BadRequest(
+                "push provider must be FCM (1) or APNs (2)".to_owned(),
+            ));
+        }
+        let token = req.device_token.trim().to_owned();
+        if token.is_empty() || token.len() > 512 {
+            return Err(ServerError::BadRequest(
+                "device_token must be 1..=512 bytes".to_owned(),
+            ));
+        }
+        let bundle_id = req.app_bundle_id.trim().chars().take(128).collect();
+        let record = PushDeviceRecord {
+            user_id,
+            token_sha256,
+            provider,
+            device_token: token.clone(),
+            app_bundle_id: bundle_id,
+            sandbox: req.sandbox,
+            updated_at_ms: now_ms,
+        };
+        let mut guard = self.state.write().await;
+        // Prevent hijacking a push token that is actively bound to another user's live session (`CRIT-05`)
+        if let Some(existing) = guard.push_devices.get(&token) {
+            if existing.user_id != user_id && guard.sessions.contains_key(&existing.token_sha256) {
+                return Err(ServerError::Unauthorized);
+            }
+        }
+        guard.push_devices.insert(token, record.clone());
+        Ok(record)
+    }
+
+    pub async fn revoke_push_device(
+        &self,
+        user_id: u64,
+        token_sha256: &[u8; 32],
+        device_token: &str,
+    ) -> ServerResult<bool> {
+        let mut guard = self.state.write().await;
+        let before = guard.push_devices.len();
+        if device_token.is_empty() {
+            guard
+                .push_devices
+                .retain(|_, d| !(d.user_id == user_id && &d.token_sha256 == token_sha256));
+        } else {
+            guard
+                .push_devices
+                .retain(|tok, d| !(d.user_id == user_id && tok == device_token));
+        }
+        Ok(guard.push_devices.len() < before)
+    }
+
+    pub async fn get_push_devices_for_user(
+        &self,
+        user_id: u64,
+    ) -> ServerResult<Vec<PushDeviceRecord>> {
+        let guard = self.state.read().await;
+        let mut list: Vec<PushDeviceRecord> = guard
+            .push_devices
+            .values()
+            .filter(|d| d.user_id == user_id)
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| a.device_token.cmp(&b.device_token));
+        Ok(list)
     }
 }
 

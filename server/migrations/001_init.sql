@@ -86,3 +86,16 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_history ON messages (chat_id, msg_id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_media_id ON messages (media_id) WHERE media_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS push_devices (
+    device_token     VARCHAR(512) PRIMARY KEY,
+    user_id          BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    token_sha256     BYTEA NOT NULL REFERENCES user_sessions(token_sha256) ON DELETE CASCADE,
+    provider         INTEGER NOT NULL, -- 1 = FCM (Android), 2 = APNs (iOS)
+    app_bundle_id    VARCHAR(128) NOT NULL DEFAULT '',
+    sandbox          BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at_ms    BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices (user_id);
+

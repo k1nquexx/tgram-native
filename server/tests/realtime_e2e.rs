@@ -919,3 +919,150 @@ async fn login_timing_mitigation_executes_argon2id_for_unknown_user() {
         "MemoryStore::authenticate(Login) must run dummy Argon2id for unknown usernames (M-01)"
     );
 }
+
+#[tokio::test]
+async fn mobile_push_token_registration_and_offline_apns_fcm_wakeup_dispatch() {
+    use std::sync::Arc;
+    use tgram_proto::{PushProvider, RegisterPushTokenRequest, RegisterPushTokenResponse};
+    use tgram_server::connection::serve_connection;
+    use tgram_server::hub::RealtimeHub;
+    use tgram_server::media::MediaManager;
+    use tgram_server::store::StorageEngine;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let temp_media = std::env::temp_dir().join(format!(
+        "tgram_test_mobile_push_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_media).await;
+
+    let server_key = generate_server_signing_key();
+    let server_pub = server_key.verifying_key();
+    let cfg = Arc::new(ServerConfig {
+        bind_addr: addr,
+        signing_key: server_key,
+        database_url: None,
+        redis_url: None,
+        media_dir: temp_media.clone(),
+        handshake_timeout: Duration::from_secs(5),
+        unauth_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 128,
+        max_uploads_per_user: 4,
+        max_total_uploads: 64,
+        upload_session_ttl: Duration::from_secs(60),
+        seed_demo_data: false,
+    });
+
+    let store = StorageEngine::new_memory(false);
+    let media = Arc::new(MediaManager::new(temp_media.clone()).await.unwrap());
+    let hub = RealtimeHub::new(store, media);
+
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let hub_srv = Arc::clone(&hub);
+    let cfg_srv = Arc::clone(&cfg);
+    let accept_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                res = listener.accept() => {
+                    if let Ok((stream, peer_addr)) = res {
+                        let c = Arc::clone(&cfg_srv);
+                        let h = Arc::clone(&hub_srv);
+                        tokio::spawn(async move {
+                            serve_connection(stream, peer_addr, c, h).await;
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    let mut alice = TestWireClient::connect(addr, &server_pub).await;
+    let mut bob_mobile = TestWireClient::connect(addr, &server_pub).await;
+
+    let _alice_uid = alice.register_user(1, "alice_push", "Alice").await;
+    let bob_uid = bob_mobile.register_user(1, "bob_mobile", "Bob Mobile").await;
+
+    // 1. Bob registers iOS APNs token + Android FCM token via 0x0014 OP_REGISTER_PUSH_REQ
+    bob_mobile
+        .send_proto(
+            Opcode::RegisterPushTokenReq,
+            2,
+            &RegisterPushTokenRequest {
+                provider: PushProvider::Apns as i32,
+                device_token: "ios-apns-device-token-001".to_owned(),
+                app_bundle_id: "org.tgram.native.ios".to_owned(),
+                sandbox: true,
+            },
+        )
+        .await;
+    let apns_res: RegisterPushTokenResponse = bob_mobile
+        .recv_rpc_reply(2)
+        .await
+        .decode_proto()
+        .unwrap();
+    assert!(apns_res.registered);
+
+    bob_mobile
+        .send_proto(
+            Opcode::RegisterPushTokenReq,
+            3,
+            &RegisterPushTokenRequest {
+                provider: PushProvider::Fcm as i32,
+                device_token: "android-fcm-device-token-002".to_owned(),
+                app_bundle_id: "org.tgram.mobile".to_owned(),
+                sandbox: false,
+            },
+        )
+        .await;
+    let fcm_res: RegisterPushTokenResponse = bob_mobile
+        .recv_rpc_reply(3)
+        .await
+        .decode_proto()
+        .unwrap();
+    assert!(fcm_res.registered);
+
+    // 2. Bob's mobile client enters background -> drops TCP socket cleanly
+    drop(bob_mobile);
+    for _ in 0..40 {
+        if !hub.is_user_online(bob_uid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!hub.is_user_online(bob_uid));
+
+    // 3. Alice sends a message to offline Bob -> Server PushGateway dispatches APNs & FCM wakeups
+    alice
+        .send_proto(
+            Opcode::SendMessageReq,
+            10,
+            &SendMessageRequest {
+                chat_id: 0,
+                target_user_id: bob_uid,
+                client_random_id: 909_090,
+                text: "Wake up via APNs & FCM!".to_owned(),
+                reply_to_msg_id: 0,
+                media_id: String::new(),
+            },
+        )
+        .await;
+    let send_ack: SendMessageAck = alice.recv_rpc_reply(10).await.decode_proto().unwrap();
+    assert!(send_ack.msg_id > 0);
+
+    let pushes = hub.push.dispatched_for_user(bob_uid).await;
+    assert_eq!(pushes.len(), 2);
+    assert!(pushes
+        .iter()
+        .any(|p| p.provider == PushProvider::Apns && p.wire_json.contains("\"mutable-content\":1")));
+    assert!(pushes
+        .iter()
+        .any(|p| p.provider == PushProvider::Fcm && p.wire_json.contains("\"priority\":\"HIGH\"")));
+
+    let _ = stop_tx.send(());
+    let _ = accept_task.await;
+    let _ = tokio::fs::remove_dir_all(&temp_media).await;
+}
+

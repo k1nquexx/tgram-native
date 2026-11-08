@@ -4,6 +4,7 @@ pub mod connection;
 pub mod error;
 pub mod hub;
 pub mod media;
+pub mod push;
 pub mod store;
 
 use std::future::Future;
@@ -50,6 +51,9 @@ where
     );
     let cleanup_worker = MediaManager::start_cleanup_worker(Arc::clone(&media));
     let hub = RealtimeHub::new(store, media);
+    if let Some(ref r_url) = config.redis_url {
+        hub.spawn_cluster_redis_publisher(r_url);
+    }
     let config = Arc::new(config);
 
     let local_addr = listener

@@ -1,5 +1,5 @@
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use argon2::{
     password_hash::{
@@ -10,10 +10,22 @@ use argon2::{
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 use crate::error::{ServerError, ServerResult};
 
 static DUMMY_PASSWORD_PHC: OnceLock<String> = OnceLock::new();
+static ARGON2_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn argon2_semaphore() -> &'static Semaphore {
+    ARGON2_SEMAPHORE.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 16))
+            .unwrap_or(4);
+        Semaphore::new(permits)
+    })
+}
 
 /// Telegram Desktop Night Blue official 7-color peer avatar palette (`0xRRGGBB`).
 pub const AVATAR_PALETTE_RGB: [u32; 7] = [
@@ -59,8 +71,13 @@ pub fn validate_password(password: &str) -> ServerResult<()> {
     Ok(())
 }
 
-/// Offloads memory-hard Argon2id hashing to Tokio's blocking thread pool so async I/O workers never stall.
+/// Offloads memory-hard Argon2id hashing to Tokio's blocking thread pool with bounded concurrency (`CRIT-03`).
 pub async fn hash_password_async(password: String) -> ServerResult<String> {
+    let _permit = timeout(Duration::from_secs(5), argon2_semaphore().acquire())
+        .await
+        .map_err(|_| ServerError::RateLimited(5_000))?
+        .map_err(|_| ServerError::Internal("argon2 semaphore closed".to_owned()))?;
+
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut PwOsRng);
         Argon2::default()
@@ -72,8 +89,13 @@ pub async fn hash_password_async(password: String) -> ServerResult<String> {
     .map_err(|e| ServerError::Internal(format!("blocking pool join error: {e}")))?
 }
 
-/// Offloads constant-time Argon2id verification to Tokio's blocking thread pool.
+/// Offloads constant-time Argon2id verification to Tokio's blocking thread pool with bounded concurrency (`CRIT-03`).
 pub async fn verify_password_async(password: String, phc_hash: String) -> ServerResult<bool> {
+    let _permit = timeout(Duration::from_secs(5), argon2_semaphore().acquire())
+        .await
+        .map_err(|_| ServerError::RateLimited(5_000))?
+        .map_err(|_| ServerError::Internal("argon2 semaphore closed".to_owned()))?;
+
     tokio::task::spawn_blocking(move || {
         let Ok(parsed) = PasswordHash::new(&phc_hash) else {
             return false;

@@ -1,5 +1,7 @@
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::mapref::entry::Entry;
@@ -15,10 +17,14 @@ use tgram_proto::{
 
 use crate::error::{ServerError, ServerResult};
 use crate::media::MediaManager;
+use crate::push::PushGateway;
 use crate::store::{unix_millis_now, StorageEngine};
 
 pub const SESSION_OUTBOX_CAPACITY: usize = 1024;
+pub const MAX_CONNS_PER_IP: usize = 64;
+pub const MAX_UNAUTH_CONNECTIONS: usize = 1024;
 const TYPING_TTL_MS: u32 = 6_000;
+const MAX_IP_RATE_ENTRIES: usize = 16_384;
 
 /// Pre-serialized wire packet ready to be AEAD-sealed by a connection's writer task.
 #[derive(Clone, Debug)]
@@ -55,20 +61,133 @@ struct SessionHandle {
 pub struct RealtimeHub {
     next_conn_id: AtomicU64,
     active_sockets: AtomicUsize,
+    unauth_sockets: AtomicUsize,
+    connections_per_ip: DashMap<IpAddr, usize>,
+    rate_buckets_by_ip: DashMap<IpAddr, (f64, Instant)>,
     sessions_by_user: DashMap<u64, Vec<SessionHandle>>,
+    cluster_tx: tokio::sync::broadcast::Sender<(u64, OutboundPacket)>,
     pub store: StorageEngine,
     pub media: Arc<MediaManager>,
+    pub push: Arc<PushGateway>,
 }
 
 impl RealtimeHub {
     pub fn new(store: StorageEngine, media: Arc<MediaManager>) -> Arc<Self> {
+        let (cluster_tx, _) = tokio::sync::broadcast::channel(4096);
         Arc::new(Self {
             next_conn_id: AtomicU64::new(1),
             active_sockets: AtomicUsize::new(0),
+            unauth_sockets: AtomicUsize::new(0),
+            connections_per_ip: DashMap::with_capacity_and_shard_amount(1024, 32),
+            rate_buckets_by_ip: DashMap::with_capacity_and_shard_amount(2048, 32),
             sessions_by_user: DashMap::with_capacity_and_shard_amount(4096, 64),
+            cluster_tx,
             store,
             media,
+            push: Arc::new(PushGateway::default()),
         })
+    }
+
+    /// Computes the sharded Redis Pub/Sub channel name (`tgram:user:shard:0..63`) for horizontal cluster fanout (`LOW-01`).
+    #[inline]
+    pub fn redis_shard_channel_for_user(user_id: u64) -> String {
+        format!("tgram:user:shard:{}", user_id % 64)
+    }
+
+    /// Spawns a background Redis Pub/Sub publisher forwarding cluster events to user-sharded channels
+    /// while monitoring broadcast ring-buffer lag (`REM-05`).
+    pub fn spawn_cluster_redis_publisher(&self, redis_url: &str) {
+        let Ok(client) = redis::Client::open(redis_url) else {
+            return;
+        };
+        let mut rx = self.cluster_tx.subscribe();
+        tokio::spawn(async move {
+            let Ok(mut conn) = redis::aio::ConnectionManager::new(client).await else {
+                return;
+            };
+            loop {
+                match rx.recv().await {
+                    Ok((user_id, pkt)) => {
+                        let channel = Self::redis_shard_channel_for_user(user_id);
+                        let payload_hex = hex::encode(&pkt.payload);
+                        let env = format!("{}:{}:{}:{}", user_id, pkt.opcode as u16, pkt.req_id, payload_hex);
+                        let _: Result<(), _> = redis::AsyncCommands::publish(&mut conn, channel, env).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "Cluster Redis publisher lagged behind broadcast buffer");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// Admits a new pre-authentication TCP connection only if global unauthenticated and per-IP caps allow (`CRIT-07`).
+    pub fn try_acquire_ip_and_unauth_slot(&self, ip: IpAddr) -> bool {
+        let prev_unauth = self.unauth_sockets.fetch_add(1, Ordering::AcqRel);
+        if prev_unauth >= MAX_UNAUTH_CONNECTIONS {
+            self.unauth_sockets.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+
+        let mut entry = self.connections_per_ip.entry(ip).or_insert(0);
+        if *entry >= MAX_CONNS_PER_IP {
+            drop(entry);
+            self.unauth_sockets.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        *entry += 1;
+        true
+    }
+
+    #[inline]
+    pub fn promote_unauth_to_authenticated(&self) {
+        self.unauth_sockets.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn release_ip_slot(&self, ip: IpAddr, still_unauth: bool) {
+        if still_unauth {
+            self.unauth_sockets.fetch_sub(1, Ordering::AcqRel);
+        }
+        if let Entry::Occupied(mut occ) = self.connections_per_ip.entry(ip) {
+            *occ.get_mut() = occ.get().saturating_sub(1);
+            if *occ.get() == 0 {
+                occ.remove();
+            }
+        }
+    }
+
+    /// Enforces a persistent per-IP token bucket so reconnecting sockets cannot reset rate limits (`CRIT-07`).
+    pub fn consume_ip_rate_tokens(
+        &self,
+        ip: IpAddr,
+        cost: f64,
+        capacity: f64,
+        refill_per_sec: f64,
+    ) -> Result<(), u32> {
+        if self.rate_buckets_by_ip.len() >= MAX_IP_RATE_ENTRIES && !self.rate_buckets_by_ip.contains_key(&ip) {
+            if let Some(evict_ip) = self.rate_buckets_by_ip.iter().next().map(|e| *e.key()) {
+                self.rate_buckets_by_ip.remove(&evict_ip);
+            }
+        }
+        let now = Instant::now();
+        let mut entry = self
+            .rate_buckets_by_ip
+            .entry(ip)
+            .or_insert((capacity, now));
+        let (ref mut tokens, ref mut last_refill) = *entry;
+        let elapsed = now.duration_since(*last_refill).as_secs_f64();
+        *tokens = (*tokens + elapsed * refill_per_sec).min(capacity);
+        *last_refill = now;
+
+        if *tokens >= cost {
+            *tokens -= cost;
+            Ok(())
+        } else {
+            let deficit = cost - *tokens;
+            let wait_ms = ((deficit / refill_per_sec) * 1000.0).ceil() as u32;
+            Err(wait_ms.max(50))
+        }
     }
 
     #[inline]
@@ -194,6 +313,7 @@ impl RealtimeHub {
         packet: OutboundPacket,
         exclude_conn_id: Option<u64>,
     ) {
+        let _ = self.cluster_tx.send((user_id, packet.clone()));
         let handles: Vec<SessionHandle> = match self.sessions_by_user.get(&user_id) {
             Some(list) => list.value().clone(),
             None => return,
@@ -292,6 +412,26 @@ impl RealtimeHub {
                     None
                 };
                 self.push_to_user(target.user_id, pkt, exclude);
+
+                // When a recipient has no active TCP sessions (iOS Background / Android Doze Mode),
+                // wake their registered mobile devices via APNs (`mutable-content: 1`) / FCM (`HIGH`).
+                if target.user_id != sender_id && !self.is_user_online(target.user_id) {
+                    if let Ok(devices) = self.store.get_push_devices_for_user(target.user_id).await
+                    {
+                        if !devices.is_empty() {
+                            self.push
+                                .notify_offline_message(
+                                    target.user_id,
+                                    &devices,
+                                    &outcome.sender_profile,
+                                    &outcome.message,
+                                    target.unread_count,
+                                    target.pts,
+                                )
+                                .await;
+                        }
+                    }
+                }
             }
         }
 

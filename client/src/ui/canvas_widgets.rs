@@ -475,26 +475,59 @@ pub fn measure_bubble_layout(
     let last_line_w = wrapped.last_line_px;
     let lines = wrapped.lines;
 
-    let time_w = measure_text_px(&msg.time_label, 11.5, false);
+    let meta_label = if msg.is_edited {
+        format!("изм. {}", msg.time_label)
+    } else {
+        msg.time_label.clone()
+    };
+    let time_w = measure_text_px(&meta_label, 11.5, false);
     let meta_reserve_w = time_w + if msg.is_outgoing { 24.0 } else { 6.0 };
     let header_name_w = if show_sender_header {
         measure_text_px(&msg.sender_name, 13.0, true) + 8.0
     } else {
         0.0
     };
+    let reply_min_w = if msg.reply_to_msg_id > 0 {
+        let author_str = if msg.reply_sender_name.is_empty() {
+            format!("Сообщение #{}", msg.reply_to_msg_id)
+        } else {
+            msg.reply_sender_name.clone()
+        };
+        let snip_str = if msg.reply_snippet.is_empty() {
+            format!("Ответ на сообщение #{}", msg.reply_to_msg_id)
+        } else {
+            msg.reply_snippet.clone()
+        };
+        let aw = measure_text_px(&author_str, 11.5, true);
+        let sw = measure_text_px(&snip_str, 12.0, false).min(max_inner_w - 18.0);
+        aw.max(sw) + 20.0
+    } else {
+        0.0
+    };
     let media_min_w = if msg.media.is_some() { 248.0 } else { 0.0 };
+    let reactions_min_w = if !msg.reactions.is_empty() {
+        (msg.reactions.len() as f32) * 48.0 + 8.0
+    } else {
+        0.0
+    };
 
-    let inline_meta = !lines.is_empty() && (last_line_w + meta_reserve_w + 12.0 <= max_inner_w);
+    let inline_meta = msg.reactions.is_empty()
+        && !lines.is_empty()
+        && (last_line_w + meta_reserve_w + 12.0 <= max_inner_w);
 
     let desired_inner_w = if inline_meta && lines.len() == 1 {
         (last_line_w + meta_reserve_w + 12.0)
             .max(header_name_w)
+            .max(reply_min_w)
             .max(media_min_w)
+            .max(reactions_min_w)
     } else {
         widest_line
             .max(meta_reserve_w + 8.0)
             .max(header_name_w)
+            .max(reply_min_w)
             .max(media_min_w)
+            .max(reactions_min_w)
     };
 
     let bubble_width = (desired_inner_w + pad_x * 2.0).clamp(88.0, max_bubble_w);
@@ -503,8 +536,12 @@ pub fn measure_bubble_layout(
     if show_sender_header {
         inner_h += 19.0;
     }
-    if msg.media.is_some() {
-        inner_h += 54.0;
+    if msg.reply_to_msg_id > 0 {
+        inner_h += 36.0;
+    }
+    if let Some(ref media_state) = msg.media {
+        let is_img = is_image_attachment(&media_state.attachment);
+        inner_h += if is_img { 116.0 } else { 54.0 };
         if !lines.is_empty() {
             inner_h += 6.0;
         }
@@ -517,6 +554,9 @@ pub fn measure_bubble_layout(
     } else {
         // Media-only message still reserves timestamp footer line
         inner_h += 16.0;
+    }
+    if !msg.reactions.is_empty() {
+        inner_h += 24.0;
     }
     inner_h += 7.0; // Bottom padding
 
@@ -1111,13 +1151,72 @@ impl<Message> canvas::Program<Message> for MessageBubbleCanvas {
             cursor_y += 19.0;
         }
 
-        // 2. Optional Media Attachment Card with Progress Bar
+        // 1B. Optional Quoted Reply Block with Vertical Accent Bar (`reply_to_msg_id > 0`)
+        if self.msg.reply_to_msg_id > 0 {
+            let quote_h = 32.0_f32;
+            let quote_bg = Path::rounded_rectangle(
+                Point::new(inner_x, cursor_y),
+                Size::new(inner_w, quote_h),
+                5.0.into(),
+            );
+            frame.fill(&quote_bg, Color::from_rgba(0.32, 0.53, 0.76, 0.14));
+
+            let accent_bar = Path::rounded_rectangle(
+                Point::new(inner_x, cursor_y),
+                Size::new(3.0, quote_h),
+                1.5.into(),
+            );
+            frame.fill(&accent_bar, ACCENT_TEXT);
+
+            let raw_author = if self.msg.reply_sender_name.is_empty() {
+                format!("Сообщение #{}", self.msg.reply_to_msg_id)
+            } else {
+                self.msg.reply_sender_name.clone()
+            };
+            let raw_snip = if self.msg.reply_snippet.is_empty() {
+                format!("Ответ на сообщение #{}", self.msg.reply_to_msg_id)
+            } else {
+                self.msg.reply_snippet.clone()
+            };
+
+            let text_max_w = (inner_w - 14.0).max(40.0);
+            let author_line = truncate_to_px(&raw_author, text_max_w, 11.5, true);
+            let snip_line = truncate_to_px(&raw_snip, text_max_w, 12.0, false);
+
+            frame.fill_text(Text {
+                content: author_line,
+                position: Point::new(inner_x + 9.0, cursor_y + 2.0),
+                color: ACCENT_TEXT,
+                size: Pixels(11.5),
+                font: FONT_BOLD,
+                horizontal_alignment: Horizontal::Left,
+                vertical_alignment: Vertical::Top,
+                shaping: Shaping::Advanced,
+                ..Text::default()
+            });
+            frame.fill_text(Text {
+                content: snip_line,
+                position: Point::new(inner_x + 9.0, cursor_y + 16.0),
+                color: TEXT_MAIN,
+                size: Pixels(12.0),
+                horizontal_alignment: Horizontal::Left,
+                vertical_alignment: Vertical::Top,
+                shaping: Shaping::Advanced,
+                ..Text::default()
+            });
+
+            cursor_y += 36.0;
+        }
+
+        // 2. Optional Media Attachment Card with Progress Bar & Image Preview
         if let Some(ref media_state) = self.msg.media {
+            let is_img = is_image_attachment(&media_state.attachment);
+            let card_h = if is_img { 112.0 } else { 50.0 };
             let card_rect = Rectangle {
                 x: inner_x,
                 y: cursor_y,
                 width: inner_w,
-                height: 50.0,
+                height: card_h,
             };
             let card_hovered = cursor.is_over(bounds);
             draw_media_card(
@@ -1127,7 +1226,7 @@ impl<Message> canvas::Program<Message> for MessageBubbleCanvas {
                 self.msg.is_outgoing,
                 card_hovered,
             );
-            cursor_y += 54.0;
+            cursor_y += if is_img { 116.0 } else { 54.0 };
             if !self.measured.lines.is_empty() {
                 cursor_y += 6.0;
             }
@@ -1148,12 +1247,54 @@ impl<Message> canvas::Program<Message> for MessageBubbleCanvas {
             cursor_y += BUBBLE_LINE_HEIGHT;
         }
 
-        // 4. Inline Bottom-Right Timestamp & Delivery Checkmarks (`✓` / `✓✓`)
+        // 3B. Optional Emoji Reaction Pills (`👍 1`, `❤️ 2`, ...)
+        if !self.msg.reactions.is_empty() {
+            let mut pill_x = inner_x;
+            let pill_y = cursor_y + 2.0;
+            for (emoji, count, chosen_by_self) in &self.msg.reactions {
+                let label = format!("{emoji} {count}");
+                let pill_w = (measure_text_px(&label, 11.5, true) + 14.0).max(38.0);
+                let pill_h = 20.0_f32;
+                if pill_x + pill_w > inner_x + inner_w {
+                    break;
+                }
+                let pill_path = Path::rounded_rectangle(
+                    Point::new(pill_x, pill_y),
+                    Size::new(pill_w, pill_h),
+                    10.0.into(),
+                );
+                let pill_bg = if *chosen_by_self {
+                    ACCENT
+                } else {
+                    Color::from_rgba(0.32, 0.53, 0.76, 0.22)
+                };
+                frame.fill(&pill_path, pill_bg);
+                frame.fill_text(Text {
+                    content: label,
+                    position: Point::new(pill_x + pill_w * 0.5, pill_y + pill_h * 0.5),
+                    color: TEXT_MAIN,
+                    size: Pixels(11.5),
+                    font: FONT_BOLD,
+                    horizontal_alignment: Horizontal::Center,
+                    vertical_alignment: Vertical::Center,
+                    shaping: Shaping::Advanced,
+                    ..Text::default()
+                });
+                pill_x += pill_w + 5.0;
+            }
+        }
+
+        // 4. Inline Bottom-Right Timestamp, Edited Marker (`изм.`) & Delivery Checkmarks (`✓` / `✓✓`)
         let meta_y = by + bh - 18.5;
         let time_color = if self.msg.is_outgoing {
             TEXT_TIME_OUT
         } else {
             TEXT_TIME_IN
+        };
+        let meta_label = if self.msg.is_edited {
+            format!("изм. {}", self.msg.time_label)
+        } else {
+            self.msg.time_label.clone()
         };
 
         if self.msg.is_outgoing {
@@ -1165,7 +1306,7 @@ impl<Message> canvas::Program<Message> for MessageBubbleCanvas {
                 TICK_OUT_COLOR,
             );
             frame.fill_text(Text {
-                content: self.msg.time_label.clone(),
+                content: meta_label,
                 position: Point::new(tick_x - 4.0, meta_y),
                 color: time_color,
                 size: Pixels(11.5),
@@ -1176,7 +1317,7 @@ impl<Message> canvas::Program<Message> for MessageBubbleCanvas {
             });
         } else {
             frame.fill_text(Text {
-                content: self.msg.time_label.clone(),
+                content: meta_label,
                 position: Point::new(bx + bw - 12.0, meta_y),
                 color: time_color,
                 size: Pixels(11.5),
@@ -1191,6 +1332,18 @@ impl<Message> canvas::Program<Message> for MessageBubbleCanvas {
     }
 }
 
+fn is_image_attachment(att: &tgram_proto::MediaAttachment) -> bool {
+    if att.mime_type.starts_with("image/") {
+        return true;
+    }
+    let lower = att.file_name.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif")
+}
+
 fn draw_media_card(
     frame: &mut Frame,
     rect: Rectangle,
@@ -1198,6 +1351,7 @@ fn draw_media_card(
     is_outgoing: bool,
     hovered: bool,
 ) {
+    let is_img = is_image_attachment(&media.attachment);
     let card_bg = if is_outgoing {
         if hovered {
             rgba8(0x1B, 0x3A, 0x59, 0.72)
@@ -1215,7 +1369,37 @@ fn draw_media_card(
         card_bg,
     );
 
-    let icon_center = Point::new(rect.x + 25.0, rect.y + rect.height * 0.5);
+    let info_top_y = if is_img && rect.height >= 100.0 {
+        let thumb_rect = Rectangle {
+            x: rect.x + 6.0,
+            y: rect.y + 6.0,
+            width: (rect.width - 12.0).max(40.0),
+            height: 58.0,
+        };
+        frame.fill(
+            &Path::rounded_rectangle(thumb_rect.position(), thumb_rect.size(), 6.0.into()),
+            rgba8(0x0E, 0x16, 0x21, 0.72),
+        );
+        // Stylized landscape photo silhouette inside thumbnail viewport
+        let mount = Path::new(|b| {
+            b.move_to(Point::new(thumb_rect.x + 12.0, thumb_rect.y + 48.0));
+            b.line_to(Point::new(thumb_rect.x + 36.0, thumb_rect.y + 24.0));
+            b.line_to(Point::new(thumb_rect.x + 56.0, thumb_rect.y + 40.0));
+            b.line_to(Point::new(thumb_rect.x + 78.0, thumb_rect.y + 18.0));
+            b.line_to(Point::new(thumb_rect.x + 108.0, thumb_rect.y + 48.0));
+            b.close();
+        });
+        frame.fill(&mount, rgba8(0x52, 0x88, 0xC1, 0.42));
+        frame.fill(
+            &Path::circle(Point::new(thumb_rect.x + 24.0, thumb_rect.y + 18.0), 5.5),
+            ACCENT_TEXT,
+        );
+        rect.y + 64.0
+    } else {
+        rect.y
+    };
+
+    let icon_center = Point::new(rect.x + 25.0, info_top_y + 25.0);
     frame.fill(&Path::circle(icon_center, 18.0), BADGE_UNREAD);
 
     let icon_stroke = Stroke {
@@ -1302,7 +1486,7 @@ fn draw_media_card(
 
     frame.fill_text(Text {
         content: truncate_to_px(&media.attachment.file_name, max_text_w, 13.2, true),
-        position: Point::new(text_x, rect.y + 7.0),
+        position: Point::new(text_x, info_top_y + 7.0),
         color: TEXT_MAIN,
         size: Pixels(13.2),
         font: FONT_BOLD,
@@ -1314,7 +1498,7 @@ fn draw_media_card(
 
     frame.fill_text(Text {
         content: truncate_to_px(&status_line, max_text_w, 11.5, false),
-        position: Point::new(text_x, rect.y + 25.0),
+        position: Point::new(text_x, info_top_y + 25.0),
         color: if is_outgoing { TEXT_TIME_OUT } else { ACCENT_TEXT },
         size: Pixels(11.5),
         horizontal_alignment: Horizontal::Left,
@@ -1324,7 +1508,7 @@ fn draw_media_card(
     });
 
     if let Some(p) = progress_opt {
-        let bar_y = rect.y + 42.5;
+        let bar_y = info_top_y + 42.5;
         let bar_w = max_text_w;
         frame.fill(
             &Path::rounded_rectangle(

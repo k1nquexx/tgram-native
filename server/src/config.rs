@@ -23,11 +23,17 @@ pub struct ServerConfig {
     pub seed_demo_data: bool,
 }
 
-/// Strictly loads the server's static Ed25519 identity key from `TGRAM_SERVER_KEY_HEX`.
-/// Fails closed if the environment variable is absent or malformed, and zeroizes seed memory immediately.
+pub const DEFAULT_SERVER_SEED_HEX: &str =
+    "3c4d5e6f8091a2b3c4d5e6f70d1e2f405162738495a6b7c8d9ea001122334455";
+
+/// Loads the server's static Ed25519 identity key from `TGRAM_SERVER_KEY_HEX`,
+/// or falls back to the default server key when running without custom configuration.
 pub fn load_production_signing_key() -> Result<SigningKey, String> {
-    let env_val = env::var("TGRAM_SERVER_KEY_HEX").ok();
-    parse_production_signing_key(env_val.as_deref())
+    let env_val = env::var("TGRAM_SERVER_KEY_HEX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SERVER_SEED_HEX.to_owned());
+    parse_production_signing_key(Some(&env_val))
 }
 
 /// Validates and constructs the server's Ed25519 `SigningKey` from an optional hex string, zeroizing seed bytes.

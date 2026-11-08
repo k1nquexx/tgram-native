@@ -82,7 +82,11 @@ Every post-handshake message is transmitted as a discrete AEAD frame (`32 bytes`
 
 ---
 
-## 4. Keep-Alive & Reconnection Semantics
+## 4. Keep-Alive, Mobile Lifecycle & Reconnection Semantics
 - Client `NetworkThread` sends `OP_PING (0x0001)` every **25 seconds** of socket inactivity.
 - If `OP_PONG (0x0002)` is not received within **10 seconds**, client aborts socket and enters exponential backoff (`250ms`, `500ms`, `1000ms`, `2000ms`, capped at `5000ms` ± 20% random jitter).
 - Upon reconnect, client performs fresh X25519 handshake -> sends `OP_AUTH_REQ` with `AUTH_METHOD_TOKEN_RESUME` + `last_known_pts` -> flushes any pending unacknowledged `OP_SEND_MESSAGE_REQ` queued in SQLite outbox (deduplicated server-side by `(sender_id, client_random_id)`).
+- **Mobile Background & Cellular/Wi-Fi Handoff (iOS & Android):**
+  - On `EnterBackground`, the client cleanly drops the active TCP socket and enters `SuspendedBackground` (`0%` background CPU/radio wakeups).
+  - While offline, incoming messages trigger APNs (`mutable-content: 1`, `apns-push-type: alert`, `apns-priority: 10`) or FCM (`priority: HIGH`) push notifications registered via `OP_REGISTER_PUSH_REQ (0x0014)` / `OP_REGISTER_PUSH_RES (0x0015)`.
+  - On `EnterForeground` or `NotifyNetworkChanged` (Cellular <-> Wi-Fi switch), the client immediately resets backoff, establishes a fresh X25519 tunnel, and resumes via `AUTH_METHOD_TOKEN_RESUME` + `last_known_pts`.

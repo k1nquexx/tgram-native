@@ -38,6 +38,8 @@ pub enum Opcode {
     AuthRes = 0x0011,
     LogoutReq = 0x0012,
     LogoutRes = 0x0013,
+    RegisterPushTokenReq = 0x0014,
+    RegisterPushTokenRes = 0x0015,
 
     // Dialogs, History & Peer Discovery
     SyncDialogsReq = 0x0020,
@@ -103,6 +105,8 @@ impl TryFrom<u16> for Opcode {
             0x0011 => Self::AuthRes,
             0x0012 => Self::LogoutReq,
             0x0013 => Self::LogoutRes,
+            0x0014 => Self::RegisterPushTokenReq,
+            0x0015 => Self::RegisterPushTokenRes,
 
             0x0020 => Self::SyncDialogsReq,
             0x0021 => Self::SyncDialogsRes,

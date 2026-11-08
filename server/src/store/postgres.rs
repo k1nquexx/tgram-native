@@ -3,11 +3,11 @@ use std::collections::HashSet;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Row};
 use tgram_proto::{
     AuthMethod, AuthRequest, ChatMessage, CreateDirectChatResponse, DialogEntry,
-    GetHistoryResponse, MediaAttachment, PeerType, SearchPeersResponse, SendMessageRequest,
-    SyncDialogsResponse, UserOnlineState, UserProfile,
+    GetHistoryResponse, MediaAttachment, PeerType, PushProvider, RegisterPushTokenRequest,
+    SearchPeersResponse, SendMessageRequest, SyncDialogsResponse, UserOnlineState, UserProfile,
 };
 
 use crate::auth::{
@@ -17,7 +17,7 @@ use crate::auth::{
 use crate::error::{ServerError, ServerResult};
 use crate::store::{
     escape_sql_like, unix_millis_now, AuthSessionOutcome, MarkReadOutcome, PersistMessageOutcome,
-    RecipientDeliveryTarget,
+    PushDeviceRecord, RecipientDeliveryTarget,
 };
 
 const SCHEMA_SQL: &str = include_str!("../../migrations/001_init.sql");
@@ -34,6 +34,15 @@ impl PostgresStore {
         let _ = dummy_password_phc();
         let pool = PgPoolOptions::new()
             .max_connections(32)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET statement_timeout = '10s'; SET lock_timeout = '5s';")
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(database_url)
             .await
             .map_err(|e| ServerError::Database(format!("PostgreSQL connect failed: {e}")))?;
@@ -964,12 +973,36 @@ impl PostgresStore {
         .map_err(db_err)?;
 
         let member_rows = sqlx::query(
-            "UPDATE users u SET current_pts = u.current_pts + 1
-             FROM chat_members cm
-             WHERE cm.chat_id = $1 AND cm.user_id = u.user_id
-             RETURNING u.user_id, u.current_pts, cm.read_inbox_max_msg_id",
+            "WITH locked_members AS (
+                 SELECT cm.user_id, cm.read_inbox_max_msg_id
+                 FROM chat_members cm
+                 WHERE cm.chat_id = $1
+                 ORDER BY cm.user_id ASC
+             ),
+             bumped AS (
+                 UPDATE users u
+                 SET current_pts = u.current_pts + 1
+                 FROM locked_members lm
+                 WHERE u.user_id = lm.user_id
+                 RETURNING u.user_id, u.current_pts, lm.read_inbox_max_msg_id
+             )
+             SELECT
+                 b.user_id,
+                 b.current_pts,
+                 CASE
+                     WHEN b.user_id = $2 THEN 0::BIGINT
+                     ELSE COALESCE((
+                         SELECT COUNT(*)::BIGINT
+                         FROM messages m
+                         WHERE m.chat_id = $1
+                           AND m.msg_id > b.read_inbox_max_msg_id
+                           AND m.sender_id <> b.user_id
+                     ), 0)
+                 END AS unread_cnt
+             FROM bumped b",
         )
         .bind(chat_id as i64)
+        .bind(sender_id as i64)
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -981,29 +1014,13 @@ impl PostgresStore {
         for mr in member_rows {
             let uid = mr.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
             let pts = mr.try_get::<i64, _>("current_pts").map_err(db_err)? as u64;
-            let read_inbox = mr
-                .try_get::<i64, _>("read_inbox_max_msg_id")
-                .map_err(db_err)? as u64;
+            let unread_cnt = mr.try_get::<i64, _>("unread_cnt").map_err(db_err)? as u32;
             if uid == sender_id {
                 sender_pts = pts;
             }
-            let unread_count = if uid == sender_id {
-                0
-            } else {
-                let cnt: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND msg_id > $2 AND sender_id <> $3",
-                )
-                .bind(chat_id as i64)
-                .bind(read_inbox as i64)
-                .bind(uid as i64)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(db_err)?;
-                cnt as u32
-            };
             recipients.push(RecipientDeliveryTarget {
                 user_id: uid,
-                unread_count,
+                unread_count: unread_cnt,
                 pts,
             });
         }
@@ -1038,13 +1055,16 @@ impl PostgresStore {
         _now_ms: i64,
     ) -> ServerResult<MarkReadOutcome> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let updated = sqlx::query(
-            "UPDATE chat_members
-             SET read_inbox_max_msg_id = GREATEST(read_inbox_max_msg_id, $1)
-             WHERE chat_id = $2 AND user_id = $3
-             RETURNING read_inbox_max_msg_id",
+        let current_row = sqlx::query(
+            "SELECT
+                 cm.read_inbox_max_msg_id,
+                 u.current_pts,
+                 COALESCE((SELECT MAX(m.msg_id) FROM messages m WHERE m.chat_id = cm.chat_id), 0) AS highest_msg_id
+             FROM chat_members cm
+             INNER JOIN users u ON u.user_id = cm.user_id
+             WHERE cm.chat_id = $1 AND cm.user_id = $2
+             FOR UPDATE OF cm",
         )
-        .bind(max_read_msg_id as i64)
         .bind(chat_id as i64)
         .bind(reader_id as i64)
         .fetch_optional(&mut *tx)
@@ -1052,14 +1072,56 @@ impl PostgresStore {
         .map_err(db_err)?
         .ok_or(ServerError::ChatNotFound(chat_id))?;
 
-        let effective = updated
+        let prev_inbox = current_row
             .try_get::<i64, _>("read_inbox_max_msg_id")
             .map_err(db_err)? as u64;
+        let existing_pts = current_row
+            .try_get::<i64, _>("current_pts")
+            .map_err(db_err)? as u64;
+        let highest_msg_id = current_row
+            .try_get::<i64, _>("highest_msg_id")
+            .map_err(db_err)? as u64;
+
+        let clamped = max_read_msg_id.min(highest_msg_id);
+        let effective = prev_inbox.max(clamped);
+
+        if effective <= prev_inbox {
+            tx.rollback().await.ok();
+            let unread_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND msg_id > $2 AND sender_id <> $3",
+            )
+            .bind(chat_id as i64)
+            .bind(effective as i64)
+            .bind(reader_id as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+            return Ok(MarkReadOutcome {
+                chat_id,
+                max_read_msg_id: effective,
+                unread_count: unread_count as u32,
+                reader_pts: existing_pts,
+                notify_peers: Vec::new(),
+            });
+        }
+
+        sqlx::query(
+            "UPDATE chat_members
+             SET read_inbox_max_msg_id = $1
+             WHERE chat_id = $2 AND user_id = $3",
+        )
+        .bind(effective as i64)
+        .bind(chat_id as i64)
+        .bind(reader_id as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
 
         let peer_rows = sqlx::query(
             "UPDATE chat_members
-             SET read_outbox_max_msg_id = GREATEST(read_outbox_max_msg_id, $1)
-             WHERE chat_id = $2 AND user_id <> $3
+             SET read_outbox_max_msg_id = $1
+             WHERE chat_id = $2 AND user_id <> $3 AND read_outbox_max_msg_id < $1
              RETURNING user_id",
         )
         .bind(effective as i64)
@@ -1069,28 +1131,43 @@ impl PostgresStore {
         .await
         .map_err(db_err)?;
 
-        let reader_pts: i64 = sqlx::query_scalar(
-            "UPDATE users SET current_pts = current_pts + 1 WHERE user_id = $1 RETURNING current_pts",
+        let mut affected_uids: Vec<i64> = Vec::with_capacity(peer_rows.len() + 1);
+        affected_uids.push(reader_id as i64);
+        for pr in peer_rows {
+            affected_uids.push(pr.try_get::<i64, _>("user_id").map_err(db_err)?);
+        }
+        affected_uids.sort_unstable();
+        affected_uids.dedup();
+
+        let pts_rows = sqlx::query(
+            "WITH target_users AS (
+                 SELECT unnest($1::BIGINT[]) AS uid
+                 ORDER BY 1 ASC
+             )
+             UPDATE users u
+             SET current_pts = u.current_pts + 1
+             FROM target_users tu
+             WHERE u.user_id = tu.uid
+             RETURNING u.user_id, u.current_pts",
         )
-        .bind(reader_id as i64)
-        .fetch_one(&mut *tx)
+        .bind(&affected_uids)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
 
-        let mut notify_peers = Vec::with_capacity(peer_rows.len());
-        for pr in peer_rows {
-            let pid = pr.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
-            let p_pts: i64 = sqlx::query_scalar(
-                "UPDATE users SET current_pts = current_pts + 1 WHERE user_id = $1 RETURNING current_pts",
-            )
-            .bind(pid as i64)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            notify_peers.push((pid, p_pts as u64));
-        }
-
         tx.commit().await.map_err(db_err)?;
+
+        let mut reader_pts = existing_pts + 1;
+        let mut notify_peers = Vec::with_capacity(pts_rows.len().saturating_sub(1));
+        for row in pts_rows {
+            let uid = row.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
+            let pts = row.try_get::<i64, _>("current_pts").map_err(db_err)? as u64;
+            if uid == reader_id {
+                reader_pts = pts;
+            } else {
+                notify_peers.push((uid, pts));
+            }
+        }
 
         let unread_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND msg_id > $2 AND sender_id <> $3",
@@ -1106,7 +1183,7 @@ impl PostgresStore {
             chat_id,
             max_read_msg_id: effective,
             unread_count: unread_count as u32,
-            reader_pts: reader_pts as u64,
+            reader_pts,
             notify_peers,
         })
     }
@@ -1206,6 +1283,128 @@ impl PostgresStore {
         .map_err(db_err)?;
 
         Ok(allowed)
+    }
+
+    pub async fn register_push_device(
+        &self,
+        user_id: u64,
+        token_sha256: [u8; 32],
+        req: RegisterPushTokenRequest,
+        now_ms: i64,
+    ) -> ServerResult<PushDeviceRecord> {
+        let provider = PushProvider::try_from(req.provider).unwrap_or(PushProvider::Unspecified);
+        if !matches!(provider, PushProvider::Fcm | PushProvider::Apns) {
+            return Err(ServerError::BadRequest(
+                "push provider must be FCM (1) or APNs (2)".to_owned(),
+            ));
+        }
+        let token = req.device_token.trim().to_owned();
+        if token.is_empty() || token.len() > 512 {
+            return Err(ServerError::BadRequest(
+                "device_token must be 1..=512 bytes".to_owned(),
+            ));
+        }
+        let bundle_id: String = req.app_bundle_id.trim().chars().take(128).collect();
+
+        let res = sqlx::query(
+            "INSERT INTO push_devices (
+                 device_token, user_id, token_sha256, provider, app_bundle_id, sandbox, updated_at_ms
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (device_token) DO UPDATE SET
+                 user_id = EXCLUDED.user_id,
+                 token_sha256 = EXCLUDED.token_sha256,
+                 provider = EXCLUDED.provider,
+                 app_bundle_id = EXCLUDED.app_bundle_id,
+                 sandbox = EXCLUDED.sandbox,
+                 updated_at_ms = EXCLUDED.updated_at_ms
+             WHERE push_devices.user_id = EXCLUDED.user_id",
+        )
+        .bind(&token)
+        .bind(user_id as i64)
+        .bind(&token_sha256[..])
+        .bind(provider as i32)
+        .bind(&bundle_id)
+        .bind(req.sandbox)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        if res.rows_affected() == 0 {
+            return Err(ServerError::Unauthorized);
+        }
+
+        Ok(PushDeviceRecord {
+            user_id,
+            token_sha256,
+            provider,
+            device_token: token,
+            app_bundle_id: bundle_id,
+            sandbox: req.sandbox,
+            updated_at_ms: now_ms,
+        })
+    }
+
+    pub async fn revoke_push_device(
+        &self,
+        user_id: u64,
+        token_sha256: &[u8; 32],
+        device_token: &str,
+    ) -> ServerResult<bool> {
+        let res = if device_token.is_empty() {
+            sqlx::query("DELETE FROM push_devices WHERE user_id = $1 AND token_sha256 = $2")
+                .bind(user_id as i64)
+                .bind(&token_sha256[..])
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?
+        } else {
+            sqlx::query("DELETE FROM push_devices WHERE user_id = $1 AND device_token = $2")
+                .bind(user_id as i64)
+                .bind(device_token)
+                .execute(&self.pool)
+                .await
+                .map_err(db_err)?
+        };
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn get_push_devices_for_user(
+        &self,
+        user_id: u64,
+    ) -> ServerResult<Vec<PushDeviceRecord>> {
+        let rows = sqlx::query(
+            "SELECT device_token, user_id, token_sha256, provider, app_bundle_id, sandbox, updated_at_ms
+             FROM push_devices
+             WHERE user_id = $1
+             ORDER BY device_token ASC",
+        )
+        .bind(user_id as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        let mut list = Vec::with_capacity(rows.len());
+        for r in rows {
+            let raw_sha: Vec<u8> = r.try_get("token_sha256").map_err(db_err)?;
+            let mut token_sha256 = [0u8; 32];
+            if raw_sha.len() == 32 {
+                token_sha256.copy_from_slice(&raw_sha);
+            }
+            let raw_prov: i32 = r.try_get("provider").map_err(db_err)?;
+            let provider = PushProvider::try_from(raw_prov).unwrap_or(PushProvider::Unspecified);
+            list.push(PushDeviceRecord {
+                user_id: r.try_get::<i64, _>("user_id").map_err(db_err)? as u64,
+                token_sha256,
+                provider,
+                device_token: r.try_get("device_token").map_err(db_err)?,
+                app_bundle_id: r.try_get("app_bundle_id").map_err(db_err)?,
+                sandbox: r.try_get("sandbox").map_err(db_err)?,
+                updated_at_ms: r.try_get("updated_at_ms").map_err(db_err)?,
+            });
+        }
+        Ok(list)
     }
 
     async fn cache_session_in_redis(&self, token_sha256: &[u8; 32], user_id: u64) {

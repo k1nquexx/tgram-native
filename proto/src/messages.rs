@@ -218,6 +218,34 @@ pub struct LogoutResponse {
     pub revoked: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PushProvider {
+    Unspecified = 0,
+    Fcm = 1,
+    Apns = 2,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterPushTokenRequest {
+    #[prost(enumeration = "PushProvider", tag = "1")]
+    pub provider: i32,
+    #[prost(string, tag = "2")]
+    pub device_token: String,
+    #[prost(string, tag = "3")]
+    pub app_bundle_id: String,
+    #[prost(bool, tag = "4")]
+    pub sandbox: bool,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RegisterPushTokenResponse {
+    #[prost(bool, tag = "1")]
+    pub registered: bool,
+    #[prost(int64, tag = "2")]
+    pub updated_at_ms: i64,
+}
+
 // ----------------------------------------------------------------------------
 // Dialogs, History & Peer Discovery (0x0020 - 0x002F)
 // ----------------------------------------------------------------------------

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "proto",
     "server",
+    "client-core",
     "client",
 ]
 
@@ -13,8 +14,9 @@ license = "MIT"
 rust-version = "1.89"
 
 [workspace.dependencies]
-# Internal shared wire & crypto protocol crate
+# Internal shared wire & crypto protocol crate + cross-platform client core (Desktop / iOS / Android)
 tgram-proto = { path = "proto" }
+tgram-client-core = { path = "client-core" }
 
 # Async runtime & zero-copy buffers
 tokio = { version = "1.43", features = ["full"] }

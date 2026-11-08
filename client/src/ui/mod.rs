@@ -38,6 +38,16 @@ pub struct HistoryLayoutCache {
     pub total_height: f32,
 }
 
+/// Active right-click popup context menu state for a message bubble (`Блок D-1.2`).
+#[derive(Debug, Clone)]
+pub struct ContextMenuState {
+    pub chat_id: u64,
+    pub msg_id: u64,
+    pub msg_idx: usize,
+    pub is_outgoing: bool,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     BackendReady(BackendHandles),
@@ -71,10 +81,29 @@ pub enum Message {
     // Chat View & History
     ChatSearchChanged(String),
     HistoryScrolled(scrollable::Viewport),
+    ScrollHistoryToBottom,
+    JumpToMessage(u64),
     ComposerAction(text_editor::Action),
     SendCurrentMessage,
+    ReplyToMessage { chat_id: u64, msg_id: u64 },
+    ClearReplyTarget,
+    OpenMessageContextMenu { chat_id: u64, msg_idx: usize },
+    CloseContextMenu,
+    ContextMenuReply,
+    ContextMenuCopyText,
+    ContextMenuEdit,
+    ContextMenuPin,
+    UnpinChatMessage(u64),
+    ContextMenuForward,
+    ContextMenuDelete,
+    HoverMessageBubble(Option<(u64, usize)>),
+    ToggleMessageReaction {
+        chat_id: u64,
+        msg_idx: usize,
+        emoji: String,
+    },
     AttachFilePressed,
-    FilePicked(Option<PathBuf>),
+    FilePicked(Option<(PathBuf, u64)>),
     MediaBubbleClicked { chat_id: u64, msg_idx: usize },
     GenerateStressMessages,
 
@@ -129,12 +158,19 @@ pub struct TelegramApp {
     pub history_scroll_y: f32,
     pub history_viewport_h: f32,
     pub history_near_bottom: bool,
+    pub unread_while_scrolled: u32,
 
     // Ephemeral typing & composer
     pub active_typings: HashMap<(u64, u64), (TypingAction, Instant)>,
     pub typing_anim_step: u8,
     pub last_typing_sent: Option<(u64, Instant)>,
     pub composer_content: text_editor::Content,
+    pub reply_target: Option<UiMessage>,
+    pub context_menu: Option<ContextMenuState>,
+    pub hovered_msg_idx: Option<(u64, usize)>,
+    pub editing_target: Option<(usize, UiMessage)>,
+    pub pinned_message_by_chat: HashMap<u64, UiMessage>,
+    pub forward_source: Option<UiMessage>,
     pub toast_error: Option<String>,
 }
 
@@ -183,11 +219,18 @@ impl TelegramApp {
             history_scroll_y: 0.0,
             history_viewport_h: 620.0,
             history_near_bottom: true,
+            unread_while_scrolled: 0,
 
             active_typings: HashMap::new(),
             typing_anim_step: 0,
             last_typing_sent: None,
             composer_content: text_editor::Content::new(),
+            reply_target: None,
+            context_menu: None,
+            hovered_msg_idx: None,
+            editing_target: None,
+            pinned_message_by_chat: HashMap::new(),
+            forward_source: None,
             toast_error: None,
         };
 
@@ -422,14 +465,24 @@ impl TelegramApp {
             Message::HistoryScrolled(vp) => {
                 let offset_y = vp.absolute_offset().y;
                 let view_h = vp.bounds().height.max(150.0);
+                let rel_y = vp.relative_offset().y;
                 self.history_scroll_y = offset_y;
                 self.history_viewport_h = view_h;
 
                 let max_scroll = (self.active_layout.total_height - view_h).max(0.0);
-                self.history_near_bottom = (max_scroll - offset_y) <= 96.0;
+                self.history_near_bottom = (max_scroll - offset_y) <= 96.0 || rel_y >= 0.96;
+
+                if self.history_near_bottom {
+                    self.unread_while_scrolled = 0;
+                    if let Some(cid) = self.selected_chat_id {
+                        self.send_read_ack_if_needed(cid);
+                    }
+                }
 
                 // Trigger keyset backward pagination when scrolled near top while online
-                if offset_y < 140.0 && matches!(self.conn_state, ConnectionState::Online) {
+                if (offset_y < 140.0 || rel_y <= 0.05)
+                    && matches!(self.conn_state, ConnectionState::Online)
+                {
                     if let Some(cid) = self.selected_chat_id {
                         if self.has_more_history.get(&cid).copied().unwrap_or(false)
                             && !self.loading_older_history.contains(&cid)
@@ -450,6 +503,56 @@ impl TelegramApp {
                             }
                         }
                     }
+                }
+                Task::none()
+            }
+
+            Message::ScrollHistoryToBottom => {
+                self.history_near_bottom = true;
+                self.unread_while_scrolled = 0;
+                if let Some(cid) = self.selected_chat_id {
+                    self.send_read_ack_if_needed(cid);
+                }
+                self.snap_history_to_bottom()
+            }
+
+            Message::JumpToMessage(target_msg_id) => {
+                if target_msg_id == 0 {
+                    return Task::none();
+                }
+                let Some(chat_id) = self.selected_chat_id else {
+                    return Task::none();
+                };
+                let Some(messages) = self.messages_by_chat.get(&chat_id) else {
+                    return Task::none();
+                };
+                if let Some(vis_pos) = self
+                    .active_layout
+                    .indices
+                    .iter()
+                    .position(|&idx| messages.get(idx).map(|m| m.msg_id) == Some(target_msg_id))
+                {
+                    let row_y = self
+                        .active_layout
+                        .prefix_y
+                        .get(vis_pos)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let bottom_anchor_pad =
+                        (self.history_viewport_h - self.active_layout.total_height).max(0.0);
+                    let target_scroll_y =
+                        (bottom_anchor_pad + row_y - self.history_viewport_h * 0.35).max(0.0);
+                    self.history_scroll_y = target_scroll_y;
+                    let max_scroll =
+                        (self.active_layout.total_height - self.history_viewport_h).max(0.0);
+                    self.history_near_bottom = (max_scroll - target_scroll_y) <= 96.0;
+                    return scrollable::scroll_to(
+                        self.history_scroll_id.clone(),
+                        scrollable::AbsoluteOffset {
+                            x: 0.0,
+                            y: target_scroll_y,
+                        },
+                    );
                 }
                 Task::none()
             }
@@ -481,12 +584,294 @@ impl TelegramApp {
                 Task::none()
             }
 
+            Message::ReplyToMessage { chat_id, msg_id } => {
+                if msg_id > 0 && self.selected_chat_id == Some(chat_id) {
+                    if let Some(target_msg) = self
+                        .messages_by_chat
+                        .get(&chat_id)
+                        .and_then(|list| list.iter().find(|m| m.msg_id == msg_id))
+                        .cloned()
+                    {
+                        self.reply_target = Some(target_msg);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ClearReplyTarget => {
+                if self.editing_target.take().is_some() {
+                    self.composer_content = text_editor::Content::new();
+                }
+                self.reply_target = None;
+                self.forward_source = None;
+                Task::none()
+            }
+
+            Message::OpenMessageContextMenu { chat_id, msg_idx } => {
+                if let Some(msg) = self
+                    .messages_by_chat
+                    .get(&chat_id)
+                    .and_then(|list| list.get(msg_idx))
+                {
+                    self.context_menu = Some(ContextMenuState {
+                        chat_id,
+                        msg_id: msg.msg_id,
+                        msg_idx,
+                        is_outgoing: msg.is_outgoing,
+                        text: msg.text.clone(),
+                    });
+                }
+                Task::none()
+            }
+
+            Message::CloseContextMenu => {
+                self.context_menu = None;
+                Task::none()
+            }
+
+            Message::ContextMenuReply => {
+                if let Some(cm) = self.context_menu.take() {
+                    if let Some(target_msg) = self
+                        .messages_by_chat
+                        .get(&cm.chat_id)
+                        .and_then(|list| list.get(cm.msg_idx).cloned())
+                    {
+                        self.editing_target = None;
+                        self.reply_target = Some(target_msg);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ContextMenuCopyText => {
+                if let Some(cm) = self.context_menu.take() {
+                    if !cm.text.is_empty() {
+                        return iced::clipboard::write(cm.text);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ContextMenuEdit => {
+                if let Some(cm) = self.context_menu.take() {
+                    if cm.is_outgoing {
+                        if let Some(target_msg) = self
+                            .messages_by_chat
+                            .get(&cm.chat_id)
+                            .and_then(|list| list.get(cm.msg_idx).cloned())
+                        {
+                            self.reply_target = None;
+                            self.forward_source = None;
+                            self.composer_content =
+                                text_editor::Content::with_text(&target_msg.text);
+                            self.editing_target = Some((cm.msg_idx, target_msg));
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ContextMenuPin => {
+                if let Some(cm) = self.context_menu.take() {
+                    if let Some(msg) = self
+                        .messages_by_chat
+                        .get(&cm.chat_id)
+                        .and_then(|list| list.get(cm.msg_idx).cloned())
+                    {
+                        let already_pinned = self
+                            .pinned_message_by_chat
+                            .get(&cm.chat_id)
+                            .map(|p| {
+                                (msg.msg_id > 0 && p.msg_id == msg.msg_id)
+                                    || (msg.client_random_id != 0
+                                        && p.client_random_id == msg.client_random_id)
+                            })
+                            .unwrap_or(false);
+                        if already_pinned {
+                            self.pinned_message_by_chat.remove(&cm.chat_id);
+                        } else {
+                            self.pinned_message_by_chat.insert(cm.chat_id, msg);
+                        }
+                    }
+                }
+                Task::none()
+            }
+
+            Message::UnpinChatMessage(chat_id) => {
+                self.pinned_message_by_chat.remove(&chat_id);
+                Task::none()
+            }
+
+            Message::ContextMenuForward => {
+                if let Some(cm) = self.context_menu.take() {
+                    if let Some(msg) = self
+                        .messages_by_chat
+                        .get(&cm.chat_id)
+                        .and_then(|list| list.get(cm.msg_idx).cloned())
+                    {
+                        self.forward_source = Some(msg);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::ContextMenuDelete => {
+                if let Some(cm) = self.context_menu.take() {
+                    if let Some(list) = self.messages_by_chat.get_mut(&cm.chat_id) {
+                        if cm.msg_idx < list.len() {
+                            let removed = list.remove(cm.msg_idx);
+                            if self.reply_target.as_ref().map(|r| r.msg_id) == Some(removed.msg_id)
+                            {
+                                self.reply_target = None;
+                            }
+                            if self
+                                .pinned_message_by_chat
+                                .get(&cm.chat_id)
+                                .map(|p| p.msg_id)
+                                == Some(removed.msg_id)
+                            {
+                                self.pinned_message_by_chat.remove(&cm.chat_id);
+                            }
+                            if self
+                                .editing_target
+                                .as_ref()
+                                .map(|(idx, m)| *idx == cm.msg_idx || m.msg_id == removed.msg_id)
+                                .unwrap_or(false)
+                            {
+                                self.editing_target = None;
+                                self.composer_content = text_editor::Content::new();
+                            }
+                        }
+                    }
+                    self.rebuild_active_layout();
+                }
+                Task::none()
+            }
+
+            Message::HoverMessageBubble(hovered) => {
+                self.hovered_msg_idx = hovered;
+                Task::none()
+            }
+
+            Message::ToggleMessageReaction {
+                chat_id,
+                msg_idx,
+                emoji,
+            } => {
+                self.context_menu = None;
+                if let Some(msg) = self
+                    .messages_by_chat
+                    .get_mut(&chat_id)
+                    .and_then(|list| list.get_mut(msg_idx))
+                {
+                    if let Some(pos) = msg.reactions.iter().position(|(e, _, _)| *e == emoji) {
+                        let (_, ref mut cnt, ref mut mine) = msg.reactions[pos];
+                        if *mine {
+                            *cnt = cnt.saturating_sub(1);
+                            *mine = false;
+                            if *cnt == 0 {
+                                msg.reactions.remove(pos);
+                            }
+                        } else {
+                            *cnt = cnt.saturating_add(1);
+                            *mine = true;
+                        }
+                    } else {
+                        msg.reactions.push((emoji, 1, true));
+                    }
+                    self.rebuild_active_layout();
+                }
+                Task::none()
+            }
+
             Message::SendCurrentMessage => {
                 let Some(chat_id) = self.selected_chat_id else {
                     return Task::none();
                 };
+                if let Some((edit_idx, orig_msg)) = self.editing_target.take() {
+                    let raw_text = self.composer_content.text();
+                    let trimmed = raw_text.trim().to_owned();
+                    if trimmed.is_empty() {
+                        self.editing_target = Some((edit_idx, orig_msg));
+                        return Task::none();
+                    }
+                    self.composer_content = text_editor::Content::new();
+                    self.last_typing_sent = None;
+
+                    let mut updated_proto: Option<ChatMessage> = None;
+                    let mut is_last_in_chat = false;
+                    if let Some(list) = self.messages_by_chat.get_mut(&chat_id) {
+                        let target_slot = if orig_msg.msg_id > 0 {
+                            list.iter_mut().find(|m| m.msg_id == orig_msg.msg_id)
+                        } else {
+                            list.get_mut(edit_idx)
+                        };
+                        if let Some(m) = target_slot {
+                            m.text = trimmed.clone();
+                            m.is_edited = true;
+                            updated_proto = Some(ChatMessage {
+                                msg_id: m.msg_id,
+                                chat_id: m.chat_id,
+                                sender_id: m.sender_id,
+                                client_random_id: m.client_random_id,
+                                timestamp_ms: m.timestamp_ms,
+                                text: m.text.clone(),
+                                reply_to_msg_id: m.reply_to_msg_id,
+                                media: m.media.as_ref().map(|ms| ms.attachment.clone()),
+                                is_read: matches!(m.delivery, MessageDeliveryState::Read),
+                                pts: 0,
+                            });
+                        }
+                        is_last_in_chat = list
+                            .last()
+                            .map(|last| {
+                                (orig_msg.msg_id > 0 && last.msg_id == orig_msg.msg_id)
+                                    || (orig_msg.client_random_id != 0
+                                        && last.client_random_id == orig_msg.client_random_id)
+                            })
+                            .unwrap_or(false);
+                    }
+
+                    if let (Some(ref h), Some(proto_msg)) = (&self.handles, updated_proto) {
+                        let _ = h.storage_tx.send(StorageCommand::UpsertMessages {
+                            chat_id,
+                            messages: vec![proto_msg],
+                        });
+                    }
+                    if is_last_in_chat {
+                        if let Some(d) = self.dialogs.iter_mut().find(|d| d.chat_id == chat_id) {
+                            d.top_preview = trimmed.clone();
+                        }
+                    }
+                    if let Some(pinned) = self.pinned_message_by_chat.get_mut(&chat_id) {
+                        if orig_msg.msg_id > 0 && pinned.msg_id == orig_msg.msg_id {
+                            pinned.text = trimmed;
+                            pinned.is_edited = true;
+                        }
+                    }
+                    self.rebuild_active_layout();
+                    return Task::none();
+                }
+
                 let raw_text = self.composer_content.text();
-                let trimmed = raw_text.trim().to_owned();
+                let mut trimmed = raw_text.trim().to_owned();
+                if let Some(fwd) = self.forward_source.take() {
+                    let fwd_body = if !fwd.text.trim().is_empty() {
+                        fwd.text
+                    } else if let Some(med) = fwd.media {
+                        format!("📎 {}", med.attachment.file_name)
+                    } else {
+                        format!("Сообщение #{}", fwd.msg_id)
+                    };
+                    trimmed = if trimmed.is_empty() {
+                        format!("↪ Переслано от {}:\n{}", fwd.sender_name, fwd_body)
+                    } else {
+                        format!(
+                            "↪ Переслано от {}:\n{}\n\n{}",
+                            fwd.sender_name, fwd_body, trimmed
+                        )
+                    };
+                }
                 if trimmed.is_empty() {
                     return Task::none();
                 }
@@ -494,6 +879,24 @@ impl TelegramApp {
                 // Reset multi-line composer cleanly
                 self.composer_content = text_editor::Content::new();
                 self.last_typing_sent = None;
+                let reply_msg = self.reply_target.take();
+                let reply_to_msg_id = reply_msg.as_ref().map(|m| m.msg_id).unwrap_or(0);
+                let reply_sender_name = reply_msg
+                    .as_ref()
+                    .map(|m| m.sender_name.clone())
+                    .unwrap_or_default();
+                let reply_snippet = reply_msg
+                    .as_ref()
+                    .map(|m| {
+                        if !m.text.trim().is_empty() {
+                            m.text.chars().take(64).collect()
+                        } else if let Some(ref med) = m.media {
+                            format!("📎 {}", med.attachment.file_name)
+                        } else {
+                            format!("Сообщение #{}", m.msg_id)
+                        }
+                    })
+                    .unwrap_or_default();
 
                 let client_random_id = random_u64_nonzero();
                 let now_ms = unix_ms_now();
@@ -510,6 +913,11 @@ impl TelegramApp {
                     timestamp_ms: now_ms,
                     time_label: format_hh_mm(now_ms),
                     text: trimmed.clone(),
+                    is_edited: false,
+                    reactions: Vec::new(),
+                    reply_to_msg_id,
+                    reply_sender_name,
+                    reply_snippet,
                     delivery: MessageDeliveryState::Sending,
                     media: None,
                 };
@@ -535,7 +943,7 @@ impl TelegramApp {
                         client_random_id,
                         timestamp_ms: now_ms,
                         text: trimmed.clone(),
-                        reply_to_msg_id: 0,
+                        reply_to_msg_id,
                         media: None,
                         is_read: false,
                         pts: 0,
@@ -544,12 +952,22 @@ impl TelegramApp {
                         chat_id,
                         messages: vec![proto_msg],
                     });
-                    let _ = h.net_tx.send(NetCommand::SendTextMessage {
-                        chat_id,
-                        target_user_id: 0,
-                        client_random_id,
-                        text: trimmed,
-                    });
+                    if reply_to_msg_id > 0 {
+                        let _ = h.net_tx.send(NetCommand::SendReplyMessage {
+                            chat_id,
+                            target_user_id: 0,
+                            client_random_id,
+                            text: trimmed,
+                            reply_to_msg_id,
+                        });
+                    } else {
+                        let _ = h.net_tx.send(NetCommand::SendTextMessage {
+                            chat_id,
+                            target_user_id: 0,
+                            client_random_id,
+                            text: trimmed,
+                        });
+                    }
                 }
 
                 self.snap_history_to_bottom()
@@ -561,17 +979,22 @@ impl TelegramApp {
                 }
                 Task::perform(
                     async {
-                        rfd::AsyncFileDialog::new()
+                        let picked = rfd::AsyncFileDialog::new()
                             .set_title("Выберите файл для отправки")
                             .pick_file()
+                            .await?;
+                        let path = picked.path().to_path_buf();
+                        let size_bytes = tokio::fs::metadata(&path)
                             .await
-                            .map(|f| f.path().to_path_buf())
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        Some((path, size_bytes))
                     },
                     Message::FilePicked,
                 )
             }
 
-            Message::FilePicked(Some(file_path)) => {
+            Message::FilePicked(Some((file_path, size_bytes))) => {
                 let Some(chat_id) = self.selected_chat_id else {
                     return Task::none();
                 };
@@ -584,9 +1007,6 @@ impl TelegramApp {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "attachment.bin".to_owned());
-                let size_bytes = std::fs::metadata(&file_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
                 if size_bytes == 0 {
                     self.toast_error = Some("Выбранный файл пуст (0 байт)".to_owned());
                     return Task::none();
@@ -607,6 +1027,11 @@ impl TelegramApp {
                     timestamp_ms: now_ms,
                     time_label: format_hh_mm(now_ms),
                     text: caption.clone(),
+                    is_edited: false,
+                    reactions: Vec::new(),
+                    reply_to_msg_id: 0,
+                    reply_sender_name: String::new(),
+                    reply_snippet: String::new(),
                     delivery: MessageDeliveryState::Sending,
                     media: Some(UiMediaState {
                         attachment: tgram_proto::MediaAttachment {
@@ -845,7 +1270,32 @@ impl TelegramApp {
                 for u in users {
                     self.users_by_id.insert(u.user_id, u);
                 }
+                // Check which dialogs have newer messages on the server than our local cache
+                let mut chats_needing_fetch = Vec::new();
+                for d in &dialogs {
+                    if let Some(ref top) = d.top_message {
+                        if top.msg_id > 0 {
+                            let local_max = self
+                                .messages_by_chat
+                                .get(&d.chat_id)
+                                .and_then(|list| list.iter().map(|m| m.msg_id).max())
+                                .unwrap_or(0);
+                            if top.msg_id > local_max || self.selected_chat_id == Some(d.chat_id) {
+                                chats_needing_fetch.push(d.chat_id);
+                            }
+                        }
+                    }
+                }
                 self.ingest_dialogs(dialogs);
+                if let Some(ref h) = self.handles {
+                    for cid in chats_needing_fetch {
+                        let _ = h.net_tx.send(NetCommand::FetchHistory {
+                            chat_id: cid,
+                            before_msg_id: 0,
+                            limit: 80,
+                        });
+                    }
+                }
                 if self.selected_chat_id.is_none() {
                     if let Some(first_cid) = self.dialogs.first().map(|d| d.chat_id) {
                         return self.open_chat(first_cid);
@@ -921,6 +1371,15 @@ impl TelegramApp {
                     sort_ui_messages(list);
                 }
 
+                if let Some(pinned) = self.pinned_message_by_chat.get_mut(&ack.chat_id) {
+                    if ack.client_random_id != 0 && pinned.client_random_id == ack.client_random_id
+                    {
+                        pinned.msg_id = ack.msg_id;
+                        pinned.timestamp_ms = ack.server_timestamp_ms;
+                        pinned.time_label = format_hh_mm(ack.server_timestamp_ms);
+                    }
+                }
+
                 if let Some(d) = self.dialogs.iter_mut().find(|d| d.chat_id == ack.chat_id) {
                     if d.top_sender_is_self
                         && d.top_delivery == Some(MessageDeliveryState::Sending)
@@ -990,11 +1449,13 @@ impl TelegramApp {
 
                 if self.selected_chat_id == Some(chat_id) {
                     self.rebuild_active_layout();
-                    if !is_self {
-                        self.send_read_ack_if_needed(chat_id);
-                    }
                     if self.history_near_bottom || is_self {
+                        if !is_self {
+                            self.send_read_ack_if_needed(chat_id);
+                        }
                         return self.snap_history_to_bottom();
+                    } else if !is_self {
+                        self.unread_while_scrolled = self.unread_while_scrolled.saturating_add(1);
                     }
                 }
                 Task::none()
@@ -1171,6 +1632,8 @@ impl TelegramApp {
                 Task::none()
             }
 
+            BackendEvent::PushTokenRegistered { .. } => Task::none(),
+
             BackendEvent::TransientError(err) => {
                 // Release pagination lock so transient RPC timeouts never deadlock history scroll (H-01)
                 self.loading_older_history.clear();
@@ -1188,7 +1651,12 @@ impl TelegramApp {
         self.selected_chat_id = Some(chat_id);
         self.chat_search_query.clear();
         self.show_chat_search = false;
+        self.reply_target = None;
+        self.context_menu = None;
+        self.hovered_msg_idx = None;
+        self.editing_target = None;
         self.history_near_bottom = true;
+        self.unread_while_scrolled = 0;
 
         if let Some(ref h) = self.handles {
             if !self.messages_by_chat.contains_key(&chat_id) {
@@ -1458,6 +1926,11 @@ impl TelegramApp {
                     timestamp_ms: pm.timestamp_ms,
                     time_label: format_hh_mm(pm.timestamp_ms),
                     text: pm.text,
+                    is_edited: false,
+                    reactions: Vec::new(),
+                    reply_to_msg_id: pm.reply_to_msg_id,
+                    reply_sender_name: String::new(),
+                    reply_snippet: String::new(),
                     delivery,
                     media,
                 }
@@ -1487,7 +1960,21 @@ impl TelegramApp {
                     }),
                     _ => new_m.media,
                 };
+                let keep_edited = existing.is_edited || new_m.is_edited;
+                let keep_text = if existing.is_edited && !existing.text.is_empty() {
+                    existing.text.clone()
+                } else {
+                    new_m.text
+                };
+                let keep_reactions = if !existing.reactions.is_empty() {
+                    existing.reactions.clone()
+                } else {
+                    new_m.reactions
+                };
                 *existing = UiMessage {
+                    text: keep_text,
+                    is_edited: keep_edited,
+                    reactions: keep_reactions,
                     media: keep_media,
                     ..new_m
                 };
@@ -1497,6 +1984,34 @@ impl TelegramApp {
         }
 
         sort_ui_messages(list);
+
+        // Resolve quoted reply author & text snippet for any message with `reply_to_msg_id > 0`
+        let reply_lookup: HashMap<u64, (String, String)> = list
+            .iter()
+            .filter(|m| m.msg_id > 0)
+            .map(|m| {
+                let snippet = if !m.text.trim().is_empty() {
+                    m.text.chars().take(64).collect()
+                } else if let Some(ref med) = m.media {
+                    format!("📎 {}", med.attachment.file_name)
+                } else {
+                    format!("Сообщение #{}", m.msg_id)
+                };
+                (m.msg_id, (m.sender_name.clone(), snippet))
+            })
+            .collect();
+
+        for m in list.iter_mut() {
+            if m.reply_to_msg_id > 0 {
+                if let Some((r_author, r_snip)) = reply_lookup.get(&m.reply_to_msg_id) {
+                    m.reply_sender_name = r_author.clone();
+                    m.reply_snippet = r_snip.clone();
+                } else if m.reply_snippet.is_empty() {
+                    m.reply_sender_name = format!("Сообщение #{}", m.reply_to_msg_id);
+                    m.reply_snippet = "Нажмите для перехода к сообщению".to_owned();
+                }
+            }
+        }
     }
 
     fn update_dialog_preview_local(
@@ -1653,9 +2168,10 @@ fn unix_ms_now() -> i64 {
 fn open_path_in_os_shell(path: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
+        let mut select_arg = std::ffi::OsString::from("/select,");
+        select_arg.push(path.as_os_str());
         let _ = std::process::Command::new("explorer")
-            .arg("/select,")
-            .arg(path)
+            .arg(select_arg)
             .spawn();
     }
     #[cfg(target_os = "macos")]

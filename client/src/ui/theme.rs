@@ -96,7 +96,6 @@ pub fn telegram_night_blue_theme() -> Theme {
             text: TEXT_MAIN,
             primary: ACCENT,
             success: ONLINE_DOT,
-            warning: rgb8(0xFA, 0xA7, 0x74),
             danger: DANGER,
         },
     )
@@ -204,9 +203,21 @@ pub fn composer_editor_style(_theme: &Theme, _status: text_editor::Status) -> te
             width: 0.0,
             radius: 0.0.into(),
         },
+        icon: TEXT_SUB,
         placeholder: TEXT_SUB,
         value: TEXT_MAIN,
         selection: rgba8(0x52, 0x88, 0xC1, 0.42),
+    }
+}
+
+pub fn accent_bar_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(ACCENT)),
+        border: Border {
+            radius: 2.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
     }
 }
 
@@ -274,8 +285,7 @@ pub fn thin_dark_scrollable_style(theme: &Theme, status: scrollable::Status) -> 
         _ => 0.18,
     };
 
-    style.vertical_rail.scroller.background =
-        Background::Color(rgba8(0x7F, 0x91, 0xA4, thumb_alpha));
+    style.vertical_rail.scroller.color = rgba8(0x7F, 0x91, 0xA4, thumb_alpha);
     style.vertical_rail.scroller.border = Border {
         color: Color::TRANSPARENT,
         width: 0.0,

@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tgram_proto::{
     AuthRequest, ChatMessage, CreateDirectChatResponse, GetHistoryResponse, MediaAttachment,
-    SearchPeersResponse, SendMessageRequest, SyncDialogsResponse, UserProfile,
+    PushProvider, RegisterPushTokenRequest, SearchPeersResponse, SendMessageRequest,
+    SyncDialogsResponse, UserProfile,
 };
 
 use crate::error::ServerResult;
@@ -44,6 +45,17 @@ pub struct MarkReadOutcome {
     pub unread_count: u32,
     pub reader_pts: u64,
     pub notify_peers: Vec<(u64, u64)>, // (peer_user_id, peer_pts)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushDeviceRecord {
+    pub user_id: u64,
+    pub token_sha256: [u8; 32],
+    pub provider: PushProvider,
+    pub device_token: String,
+    pub app_bundle_id: String,
+    pub sandbox: bool,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Clone)]
@@ -207,6 +219,47 @@ impl StorageEngine {
         match self {
             Self::Memory(s) => s.user_has_access_to_media(user_id, media_id).await,
             Self::Postgres(s) => s.user_has_access_to_media(user_id, media_id).await,
+        }
+    }
+
+    pub async fn register_push_device(
+        &self,
+        user_id: u64,
+        token_sha256: [u8; 32],
+        req: RegisterPushTokenRequest,
+        now_ms: i64,
+    ) -> ServerResult<PushDeviceRecord> {
+        match self {
+            Self::Memory(s) => s.register_push_device(user_id, token_sha256, req, now_ms).await,
+            Self::Postgres(s) => s.register_push_device(user_id, token_sha256, req, now_ms).await,
+        }
+    }
+
+    pub async fn revoke_push_device(
+        &self,
+        user_id: u64,
+        token_sha256: &[u8; 32],
+        device_token: &str,
+    ) -> ServerResult<bool> {
+        match self {
+            Self::Memory(s) => {
+                s.revoke_push_device(user_id, token_sha256, device_token)
+                    .await
+            }
+            Self::Postgres(s) => {
+                s.revoke_push_device(user_id, token_sha256, device_token)
+                    .await
+            }
+        }
+    }
+
+    pub async fn get_push_devices_for_user(
+        &self,
+        user_id: u64,
+    ) -> ServerResult<Vec<PushDeviceRecord>> {
+        match self {
+            Self::Memory(s) => s.get_push_devices_for_user(user_id).await,
+            Self::Postgres(s) => s.get_push_devices_for_user(user_id).await,
         }
     }
 }

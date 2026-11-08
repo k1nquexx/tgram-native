@@ -17,6 +17,8 @@ option optimize_for = LITE_RUNTIME;
 //   0x0011 OP_AUTH_RES               -> AuthResponse
 //   0x0012 OP_LOGOUT_REQ             -> LogoutRequest
 //   0x0013 OP_LOGOUT_RES             -> LogoutResponse
+//   0x0014 OP_REGISTER_PUSH_REQ      -> RegisterPushTokenRequest
+//   0x0015 OP_REGISTER_PUSH_RES      -> RegisterPushTokenResponse
 //   0x0020 OP_SYNC_DIALOGS_REQ       -> SyncDialogsRequest
 //   0x0021 OP_SYNC_DIALOGS_RES       -> SyncDialogsResponse
 //   0x0022 OP_GET_HISTORY_REQ        -> GetHistoryRequest
@@ -181,6 +183,27 @@ message LogoutRequest {}
 message LogoutResponse {
   bool revoked = 1;
 }
+
+enum PushProvider {
+  PUSH_PROVIDER_UNSPECIFIED = 0;
+  PUSH_PROVIDER_FCM         = 1;
+  PUSH_PROVIDER_APNS        = 2;
+}
+
+// 0x0014: Register Mobile Push Token (FCM / APNs)
+message RegisterPushTokenRequest {
+  PushProvider provider = 1;
+  string device_token   = 2;
+  string app_bundle_id  = 3;
+  bool sandbox          = 4;
+}
+
+// 0x0015: Register Mobile Push Token Response
+message RegisterPushTokenResponse {
+  bool registered      = 1;
+  int64 updated_at_ms  = 2;
+}
+
 
 // ----------------------------------------------------------------------------
 // Dialogs & Message History Synchronization (0x0020 - 0x002F)

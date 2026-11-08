@@ -13,8 +13,8 @@ use tgram_proto::{
     flags, perform_server_handshake, AuthRequest, AuthResponse, CreateDirectChatRequest,
     DecodedFrame, FrameOpener, FrameSealer, GetHistoryRequest, LogoutRequest, LogoutResponse,
     MediaDownloadChunkRequest, MediaUploadChunkRequest, MediaUploadInitRequest, Opcode,
-    PingRequest, PongResponse, ReadAckRequest, SearchPeersRequest, SendMessageRequest,
-    SyncDialogsRequest, TypingEventRequest,
+    PingRequest, PongResponse, ReadAckRequest, RegisterPushTokenRequest, RegisterPushTokenResponse,
+    SearchPeersRequest, SendMessageRequest, SyncDialogsRequest, TypingEventRequest,
 };
 
 use crate::config::ServerConfig;
@@ -78,6 +78,12 @@ pub async fn serve_connection(
         return;
     }
 
+    if !hub.try_acquire_ip_and_unauth_slot(peer_addr.ip()) {
+        warn!(conn_id, %peer_addr, "rejecting connection: per-IP or pre-auth socket cap reached (CRIT-07)");
+        hub.decrement_sockets();
+        return;
+    }
+
     // Disable Nagle's algorithm for sub-millisecond interactive chat & typing responsiveness
     let _ = stream.set_nodelay(true);
 
@@ -91,11 +97,13 @@ pub async fn serve_connection(
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             debug!(conn_id, %peer_addr, error = %e, "MTWire handshake failed");
+            hub.release_ip_slot(peer_addr.ip(), true);
             hub.decrement_sockets();
             return;
         }
         Err(_) => {
             debug!(conn_id, %peer_addr, "MTWire handshake timed out");
+            hub.release_ip_slot(peer_addr.ip(), true);
             hub.decrement_sockets();
             return;
         }
@@ -115,7 +123,7 @@ pub async fn serve_connection(
         disconnect_rx.clone(),
     ));
 
-    reader_loop(
+    let still_unauth = reader_loop(
         conn_id,
         peer_addr,
         read_half,
@@ -129,6 +137,7 @@ pub async fn serve_connection(
     .await;
 
     let _ = writer_handle.await;
+    hub.release_ip_slot(peer_addr.ip(), still_unauth);
     hub.decrement_sockets();
     trace!(conn_id, %peer_addr, "TCP session closed");
 }
@@ -227,6 +236,7 @@ async fn writer_loop(
 }
 
 /// Dedicated read half: authenticates AEAD frames and dispatches RPC opcodes.
+/// Returns `true` if the connection remained unauthenticated upon termination.
 #[allow(clippy::too_many_arguments)]
 async fn reader_loop(
     conn_id: u64,
@@ -238,9 +248,10 @@ async fn reader_loop(
     mut disconnect_rx: watch::Receiver<bool>,
     config: Arc<ServerConfig>,
     hub: &Arc<RealtimeHub>,
-) {
+) -> bool {
     let mut rx_buf = BytesMut::with_capacity(16 * 1024);
     let mut auth_ctx: Option<AuthenticatedContext> = None;
+    let mut still_unauth = true;
     let mut limiter = TokenBucket::new(160.0, 80.0);
 
     loop {
@@ -286,14 +297,16 @@ async fn reader_loop(
                     if let Some(ctx) = auth_ctx.take() {
                         hub.unbind_user_session(ctx.user_id, conn_id).await;
                     }
-                    return;
+                    return still_unauth;
                 }
             };
 
             let req_id = frame.header.req_id;
             if let Err(err) = dispatch_frame(
                 conn_id,
+                peer_addr,
                 &mut auth_ctx,
+                &mut still_unauth,
                 &mut limiter,
                 frame,
                 &outbound_tx,
@@ -318,11 +331,15 @@ async fn reader_loop(
     if let Some(ctx) = auth_ctx.take() {
         hub.unbind_user_session(ctx.user_id, conn_id).await;
     }
+    still_unauth
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_frame(
     conn_id: u64,
+    peer_addr: SocketAddr,
     auth_ctx: &mut Option<AuthenticatedContext>,
+    still_unauth: &mut bool,
     limiter: &mut TokenBucket,
     frame: DecodedFrame,
     outbound_tx: &mpsc::Sender<OutboundPacket>,
@@ -332,15 +349,20 @@ async fn dispatch_frame(
     let opcode = frame.header.opcode;
     let req_id = frame.header.req_id;
 
-    // Rate-limit cost weighted by operation type
+    // Rate-limit cost weighted by operation type (`CRIT-03`: AuthReq costs 80.0 -> max 2 attempts per burst)
     let cost = match opcode {
         Opcode::Ping => 0.1,
         Opcode::UploadChunkReq | Opcode::DownloadChunkReq => 0.15,
-        Opcode::AuthReq => 5.0,
+        Opcode::AuthReq => 80.0,
         _ => 1.0,
     };
     if let Err(retry_ms) = limiter.try_consume(cost) {
         return Err(ServerError::RateLimited(retry_ms));
+    }
+    if opcode == Opcode::AuthReq {
+        if let Err(retry_ms) = hub.consume_ip_rate_tokens(peer_addr.ip(), cost, 160.0, 20.0) {
+            return Err(ServerError::RateLimited(retry_ms));
+        }
     }
 
     match opcode {
@@ -356,6 +378,11 @@ async fn dispatch_frame(
         Opcode::AuthReq => {
             let req: AuthRequest = frame.decode_proto()?;
             let outcome = hub.store.authenticate(req).await?;
+
+            if *still_unauth {
+                *still_unauth = false;
+                hub.promote_unauth_to_authenticated();
+            }
 
             if let Some(prev) = auth_ctx.take() {
                 if prev.user_id != outcome.profile.user_id {
@@ -388,10 +415,40 @@ async fn dispatch_frame(
         Opcode::LogoutReq => {
             let _: LogoutRequest = frame.decode_proto()?;
             let ctx = auth_ctx.take().ok_or(ServerError::Unauthorized)?;
+            let _ = hub.store.revoke_push_device(ctx.user_id, &ctx.token_sha256, "").await;
             let revoked = hub.store.revoke_session(&ctx.token_sha256).await?;
             hub.unbind_user_session(ctx.user_id, conn_id).await;
             enqueue_reply(outbound_tx, Opcode::LogoutRes, req_id, &LogoutResponse { revoked })
                 .await
+        }
+
+        Opcode::RegisterPushTokenReq => {
+            let ctx = auth_ctx.as_ref().ok_or(ServerError::Unauthorized)?;
+            let req: RegisterPushTokenRequest = frame.decode_proto()?;
+            let now = unix_millis_now();
+            let trimmed_token = req.device_token.trim();
+            if trimmed_token.is_empty() || trimmed_token.starts_with("revoke:") {
+                let target_tok = trimmed_token.trim_start_matches("revoke:").trim();
+                let _ = hub
+                    .store
+                    .revoke_push_device(ctx.user_id, &ctx.token_sha256, target_tok)
+                    .await?;
+                let res = RegisterPushTokenResponse {
+                    registered: false,
+                    updated_at_ms: now,
+                };
+                return enqueue_reply(outbound_tx, Opcode::RegisterPushTokenRes, req_id, &res)
+                    .await;
+            }
+            let rec = hub
+                .store
+                .register_push_device(ctx.user_id, ctx.token_sha256, req, now)
+                .await?;
+            let res = RegisterPushTokenResponse {
+                registered: true,
+                updated_at_ms: rec.updated_at_ms,
+            };
+            enqueue_reply(outbound_tx, Opcode::RegisterPushTokenRes, req_id, &res).await
         }
 
         Opcode::SyncDialogsReq => {
@@ -473,9 +530,14 @@ async fn dispatch_frame(
             let req: MediaUploadChunkRequest = frame.decode_proto()?;
             let (ack, completed) = hub.media.append_chunk(uid, req).await?;
             if let Some(ref attachment) = completed {
-                hub.store
+                if let Err(e) = hub
+                    .store
                     .save_media_metadata(uid, attachment, unix_millis_now())
-                    .await?;
+                    .await
+                {
+                    hub.media.remove_orphaned_media(&attachment.media_id).await;
+                    return Err(e);
+                }
             }
             enqueue_reply(outbound_tx, Opcode::UploadChunkAck, req_id, &ack).await
         }

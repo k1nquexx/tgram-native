@@ -28,6 +28,7 @@ pub const MAX_MEDIA_SIZE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
 pub const DEFAULT_MAX_UPLOADS_PER_USER: usize = 4;
 pub const DEFAULT_MAX_TOTAL_UPLOADS: usize = 1_024;
 pub const DEFAULT_UPLOAD_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_CACHED_ATTACHMENTS: usize = 10_000;
 
 #[derive(Default)]
 struct UploadQuotaTracker {
@@ -215,7 +216,21 @@ impl MediaManager {
 
     pub fn register_existing(&self, attachment: MediaAttachment) {
         if validate_safe_id(&attachment.media_id, "media_id").is_ok() {
+            if self.by_id.len() >= MAX_CACHED_ATTACHMENTS {
+                if let Some(evict_key) = self.by_id.iter().next().map(|e| e.key().clone()) {
+                    self.by_id.remove(&evict_key);
+                }
+            }
             self.by_id.insert(attachment.media_id.clone(), attachment);
+        }
+    }
+
+    /// Removes an orphaned media file from disk and memory cache if database metadata persistence fails (`HIGH-04`).
+    pub async fn remove_orphaned_media(&self, media_id: &str) {
+        if validate_safe_id(media_id, "media_id").is_ok() {
+            self.by_id.remove(media_id);
+            let path = self.media_path(media_id);
+            let _ = fs::remove_file(&path).await;
         }
     }
 
@@ -596,12 +611,32 @@ fn random_hex_id(prefix: &str) -> String {
 fn sanitize_filename(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':'))
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '/' | '\\'
+                        | '\0'
+                        | ':'
+                        | '*'
+                        | '?'
+                        | '"'
+                        | '<'
+                        | '>'
+                        | '|'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{061C}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
         .take(180)
         .collect();
-    if cleaned.trim().is_empty() {
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
         "attachment.bin".to_owned()
     } else {
-        cleaned
+        trimmed.to_owned()
     }
 }
