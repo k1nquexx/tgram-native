@@ -4,16 +4,17 @@
 
 ## Жёсткие архитектурные гарантии
 - **Zero Web Core:** Никаких Electron, Tauri, WebView, CEF, HTML/CSS/JS, QML, JVM или .NET.
-- **Аппаратный GPU-рендеринг (`Iced 0.13` + `wgpu`):** Прямая векторная отрисовка через Direct3D 12 (Windows), Metal (macOS) и Vulkan (Linux).
+- **Аппаратный GPU-рендеринг (`Iced 0.13` + `wgpu` + `cosmic-text`):** Прямая векторная отрисовка через Direct3D 12 (Windows), Metal (macOS) и Vulkan (Linux) с попиксельно точным замером и переносом глифов системных шрифтов через `cosmic-text` (`HarfRust`) и кэшированием раскладок.
 - **Двойная виртуализация списков:**
   - `O(1)` виртуализация списка чатов (`72px` фиксированные строки `DialogRowCanvas`).
   - `O(log N)` виртуализация ленты сообщений разновысотных пузырей через префиксные суммы (`HistoryLayoutCache` + бинарный поиск `partition_point`) — плавные 60/120 FPS на десятках тысяч сообщений.
 - **Строгая неблокирующая 3-поточная модель клиента:**
-  1. `UI Thread (Main)` — исключительно отрисовка `wgpu` и события ввода.
+  1. `UI Thread (Main)` — исключительно отрисовка `wgpu`, шейпинг текста и события ввода (таймстампы в локальном часовом поясе ОС через `time`).
   2. `Network Thread` (`tgram-network`) — изолированный цикл событий `Tokio` (`TCP_NODELAY`), 1-RTT рукопожатие, мультиплексирование RPC, `Ping/Pong` keep-alive и авто-реконнект с `TokenResume`.
-  3. `Storage Thread` (`tgram-storage`) — локальная БД **SQLite3** в режиме **`WAL`** (`mmap_size = 64 MB`) с AEAD-шифрованием всех записей и токенов на диске (`ChaCha20-Poly1305`).
+  3. `Storage Thread` (`tgram-storage`) — локальная БД **SQLite3** в режиме **`WAL`** (`mmap_size = 64 MB`) с AEAD-шифрованием всех записей и токенов на диске (`ChaCha20-Poly1305`). Мастер-ключ хранится в системном хранилище ОС через `keyring` (Windows Credential Manager / macOS Keychain / Linux Secret Service) или выводится через **Argon2id** из мастер-пароля `TGRAM_DB_KEY` (Passcode Lock).
 - **Собственный бинарный криптопротокол `MTWire v1`:**
   - `X25519` (эфемерный ECDH, Perfect Forward Secrecy) + `Ed25519` (подпись транскрипта против MITM) + `HKDF-SHA256` + `ChaCha20-Poly1305` (in-place шифрование фреймов без лишних аллокаций) + `Protobuf v3` (`prost`, без внешней зависимости от `protoc`).
+- **Максимальная AOT-оптимизация бинарника:** `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`, `panic = "abort"`, `strip = "symbols"`.
 
 ---
 

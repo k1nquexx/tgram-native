@@ -12,6 +12,10 @@ use crate::domain::ClientLaunchConfig;
 use crate::ui::TelegramApp;
 
 fn main() -> iced::Result {
+    // Cache the OS local UTC offset while the process is still strictly single-threaded
+    // (guarantees POSIX thread-safety on Linux/macOS alongside native Win32 tz lookup).
+    crate::domain::init_local_timezone();
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

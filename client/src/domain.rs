@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crossbeam_channel::Sender as CrossbeamSender;
+use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::mpsc::UnboundedSender;
 use tgram_proto::{
     AuthRequest, ChatMessage, DialogEntry, MediaAttachment, MessageDeliveryState, NewMessageUpdate,
@@ -324,17 +326,42 @@ pub enum BackendEvent {
     TransientError(String),
 }
 
-/// Formats Unix epoch milliseconds into `HH:MM` local-style 24h clock without heavy chrono dependencies.
-pub fn format_hh_mm(timestamp_ms: i64) -> String {
+static LOCAL_UTC_OFFSET: OnceLock<UtcOffset> = OnceLock::new();
+
+/// Captures and caches the host OS local timezone offset at startup before worker threads spawn.
+pub fn init_local_timezone() {
+    let _ = LOCAL_UTC_OFFSET.get_or_init(|| UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+}
+
+#[inline]
+pub fn local_utc_offset() -> UtcOffset {
+    *LOCAL_UTC_OFFSET.get_or_init(|| UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC))
+}
+
+#[inline]
+pub fn format_hh_mm_with_offset(timestamp_ms: i64, offset: UtcOffset) -> String {
     if timestamp_ms <= 0 {
         return String::new();
     }
-    let total_secs = (timestamp_ms / 1000).max(0);
-    // Apply local timezone offset estimation via OS or UTC+3/+7; let's compute civil clock cleanly:
-    let secs_of_day = total_secs.rem_euclid(86_400);
-    let hours = secs_of_day / 3600;
-    let minutes = (secs_of_day % 3600) / 60;
-    format!("{hours:02}:{minutes:02}")
+    let unix_secs = timestamp_ms.div_euclid(1000);
+    match OffsetDateTime::from_unix_timestamp(unix_secs) {
+        Ok(utc_dt) => {
+            let local_dt = utc_dt.to_offset(offset);
+            format!("{:02}:{:02}", local_dt.hour(), local_dt.minute())
+        }
+        Err(_) => {
+            let shifted = unix_secs.saturating_add(i64::from(offset.whole_seconds()));
+            let secs_of_day = shifted.rem_euclid(86_400);
+            let hours = secs_of_day / 3600;
+            let minutes = (secs_of_day % 3600) / 60;
+            format!("{hours:02}:{minutes:02}")
+        }
+    }
+}
+
+/// Formats Unix epoch milliseconds into `HH:MM` 24h clock in the user's local OS timezone.
+pub fn format_hh_mm(timestamp_ms: i64) -> String {
+    format_hh_mm_with_offset(timestamp_ms, local_utc_offset())
 }
 
 pub fn format_bytes_human(bytes: u64) -> String {
@@ -346,5 +373,26 @@ pub fn format_bytes_human(bytes: u64) -> String {
         format!("{:.1} KB", (bytes as f64) / KIB)
     } else {
         format!("{:.2} MB", (bytes as f64) / MIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_hh_mm_local_offsets_and_day_rollover() {
+        // 2026-01-01 21:35:00 UTC -> 1767303300_000 ms
+        let ts_ms = 1_767_303_300_000_i64;
+
+        assert_eq!(format_hh_mm_with_offset(ts_ms, UtcOffset::UTC), "21:35");
+
+        let plus_7 = UtcOffset::from_hms(7, 0, 0).expect("valid +07:00 offset");
+        assert_eq!(format_hh_mm_with_offset(ts_ms, plus_7), "04:35");
+
+        let minus_5 = UtcOffset::from_hms(-5, 0, 0).expect("valid -05:00 offset");
+        assert_eq!(format_hh_mm_with_offset(ts_ms, minus_5), "16:35");
+
+        assert_eq!(format_hh_mm_with_offset(0, plus_7), "");
     }
 }

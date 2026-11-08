@@ -1,3 +1,14 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+use cosmic_text::{
+    Attrs as CosmicAttrs, Buffer as CosmicBuffer, Family as CosmicFamily,
+    FontSystem as CosmicFontSystem, Metrics as CosmicMetrics, Shaping as CosmicShaping,
+    Weight as CosmicWeight, Wrap as CosmicWrap,
+};
 use iced::alignment::{Horizontal, Vertical};
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, LineCap, LineJoin, Path, Stroke, Text};
@@ -58,9 +69,265 @@ pub struct MeasuredBubble {
     pub show_sender_header: bool,
 }
 
-/// Estimates glyph advance at `14.5px` sans-serif for Cyrillic/Latin/Emoji wrapping.
+const MAX_WRAP_CACHE_ENTRIES: usize = 32_768;
+const MAX_WIDTH_CACHE_ENTRIES: usize = 16_384;
+
+/// Exact HarfRust-shaped wrapped lines and pixel metrics produced by `cosmic-text`.
+#[derive(Debug, Clone)]
+pub struct WrappedTextLayout {
+    pub lines: Vec<String>,
+    pub widest_line_px: f32,
+    pub last_line_px: f32,
+}
+
+struct CosmicTextMeasurer {
+    font_system: CosmicFontSystem,
+    wrap_buffer: CosmicBuffer,
+    line_buffer: CosmicBuffer,
+    wrap_cache: HashMap<(u64, usize, u32, u16), WrappedTextLayout>,
+    width_cache: HashMap<(u64, usize, u16, bool), f32>,
+}
+
+impl CosmicTextMeasurer {
+    fn new() -> Self {
+        let font_system = CosmicFontSystem::new();
+        let mut wrap_buffer =
+            CosmicBuffer::new_empty(CosmicMetrics::new(14.5, BUBBLE_LINE_HEIGHT));
+        wrap_buffer.set_wrap(CosmicWrap::WordOrGlyph);
+
+        let mut line_buffer = CosmicBuffer::new_empty(CosmicMetrics::new(14.5, 20.0));
+        line_buffer.set_wrap(CosmicWrap::None);
+
+        Self {
+            font_system,
+            wrap_buffer,
+            line_buffer,
+            wrap_cache: HashMap::with_capacity(1024),
+            width_cache: HashMap::with_capacity(1024),
+        }
+    }
+
+    #[inline]
+    fn hash_str(s: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn wrap_and_measure(
+        &mut self,
+        text: &str,
+        max_line_px: f32,
+        font_size: f32,
+    ) -> WrappedTextLayout {
+        if text.is_empty() {
+            return WrappedTextLayout {
+                lines: Vec::new(),
+                widest_line_px: 0.0,
+                last_line_px: 0.0,
+            };
+        }
+
+        let limit_px = max_line_px.max(80.0);
+        let fs_px = font_size.max(1.0);
+        let cache_key = (
+            Self::hash_str(text),
+            text.len(),
+            (limit_px * 10.0).round() as u32,
+            (fs_px * 10.0).round() as u16,
+        );
+        if let Some(cached) = self.wrap_cache.get(&cache_key) {
+            return cached.clone();
+        }
+
+        let lh_px = BUBBLE_LINE_HEIGHT.max(fs_px * 1.25);
+        self.wrap_buffer
+            .set_metrics_and_size(CosmicMetrics::new(fs_px, lh_px), Some(limit_px), None);
+        let attrs = CosmicAttrs::new().family(CosmicFamily::SansSerif);
+        self.wrap_buffer
+            .set_text(text, &attrs, CosmicShaping::Advanced, None);
+        self.wrap_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
+        let mut lines = Vec::new();
+        let mut widest_line_px = 0.0_f32;
+        let mut last_line_px = 0.0_f32;
+
+        for run in self.wrap_buffer.layout_runs() {
+            if run.glyphs.is_empty() {
+                lines.push(String::new());
+                last_line_px = 0.0;
+            } else {
+                let start_b = run.glyphs.iter().map(|g| g.start).min().unwrap_or(0);
+                let end_b = run
+                    .glyphs
+                    .iter()
+                    .map(|g| g.end)
+                    .max()
+                    .unwrap_or(run.text.len());
+                let slice = run
+                    .text
+                    .get(start_b..end_b)
+                    .unwrap_or(run.text)
+                    .trim_end_matches(' ');
+                lines.push(slice.to_owned());
+                let w = run.line_w.max(0.0);
+                widest_line_px = widest_line_px.max(w);
+                last_line_px = w;
+            }
+        }
+
+        let result = if widest_line_px <= 0.0 && !text.trim().is_empty() {
+            // Headless container fallback when zero OS fonts are installed on disk
+            fallback_wrap_without_system_fonts(text, limit_px, fs_px)
+        } else {
+            WrappedTextLayout {
+                lines,
+                widest_line_px,
+                last_line_px,
+            }
+        };
+
+        if self.wrap_cache.len() >= MAX_WRAP_CACHE_ENTRIES {
+            self.wrap_cache.clear();
+        }
+        self.wrap_cache.insert(cache_key, result.clone());
+        result
+    }
+
+    fn measure_single_line(&mut self, text: &str, font_size: f32, bold: bool) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+
+        let fs_px = font_size.max(1.0);
+        let cache_key = (
+            Self::hash_str(text),
+            text.len(),
+            (fs_px * 10.0).round() as u16,
+            bold,
+        );
+        if let Some(&cached) = self.width_cache.get(&cache_key) {
+            return cached;
+        }
+
+        self.line_buffer
+            .set_metrics_and_size(CosmicMetrics::new(fs_px, fs_px * 1.35), None, None);
+        let mut attrs = CosmicAttrs::new().family(CosmicFamily::SansSerif);
+        if bold {
+            attrs = attrs.weight(CosmicWeight::BOLD);
+        }
+        self.line_buffer
+            .set_text(text, &attrs, CosmicShaping::Advanced, None);
+        self.line_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
+        let mut width = 0.0_f32;
+        for run in self.line_buffer.layout_runs() {
+            width = width.max(run.line_w);
+        }
+
+        if width <= 0.0 && !text.trim().is_empty() {
+            width = fallback_text_width_px(text, fs_px, bold);
+        }
+
+        if self.width_cache.len() >= MAX_WIDTH_CACHE_ENTRIES {
+            self.width_cache.clear();
+        }
+        self.width_cache.insert(cache_key, width);
+        width
+    }
+
+    fn truncate_single_line(
+        &mut self,
+        text: &str,
+        max_px: f32,
+        font_size: f32,
+        bold: bool,
+    ) -> String {
+        if max_px <= 18.0 || text.is_empty() {
+            return String::new();
+        }
+
+        let normalized: Cow<'_, str> = if text.contains('\n') || text.contains('\r') {
+            Cow::Owned(
+                text.chars()
+                    .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(text)
+        };
+
+        let full_w = self.measure_single_line(&normalized, font_size, bold);
+        if full_w <= max_px {
+            return normalized.into_owned();
+        }
+
+        let fs_px = font_size.max(1.0);
+        let ellipsis_w = self.measure_single_line("…", fs_px, bold).max(8.0);
+        let target_w = (max_px - ellipsis_w).max(4.0);
+
+        self.line_buffer
+            .set_metrics_and_size(CosmicMetrics::new(fs_px, fs_px * 1.35), None, None);
+        let mut attrs = CosmicAttrs::new().family(CosmicFamily::SansSerif);
+        if bold {
+            attrs = attrs.weight(CosmicWeight::BOLD);
+        }
+        self.line_buffer
+            .set_text(&normalized, &attrs, CosmicShaping::Advanced, None);
+        self.line_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+
+        if let Some(run) = self.line_buffer.layout_runs().next() {
+            if !run.rtl && !run.glyphs.is_empty() {
+                let mut cut_end = 0usize;
+                for g in run.glyphs {
+                    if g.x + g.w <= target_w {
+                        cut_end = cut_end.max(g.end);
+                    } else {
+                        break;
+                    }
+                }
+                let prefix = normalized.get(..cut_end).unwrap_or("").trim_end();
+                let mut out = String::with_capacity(prefix.len() + 4);
+                out.push_str(prefix);
+                out.push('…');
+                return out;
+            }
+        }
+
+        // BiDi RTL or headless fontless fallback via exact char-boundary binary search
+        let char_offsets: Vec<usize> = normalized
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(normalized.len()))
+            .collect();
+        let mut lo = 0usize;
+        let mut hi = char_offsets.len().saturating_sub(1);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let slice = &normalized[..char_offsets[mid]];
+            if self.measure_single_line(slice, fs_px, bold) <= target_w {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let prefix = normalized[..char_offsets[lo]].trim_end();
+        let mut out = String::with_capacity(prefix.len() + 4);
+        out.push_str(prefix);
+        out.push('…');
+        out
+    }
+}
+
+thread_local! {
+    static COSMIC_MEASURER: RefCell<CosmicTextMeasurer> = RefCell::new(CosmicTextMeasurer::new());
+}
+
 #[inline]
-fn approx_char_advance(ch: char) -> f32 {
+fn fallback_glyph_advance_14_5(ch: char) -> f32 {
     if ch == ' ' {
         4.1
     } else if matches!(ch, 'i' | 'l' | 'I' | '.' | ',' | ':' | ';' | '!' | '|' | '\'') {
@@ -74,75 +341,86 @@ fn approx_char_advance(ch: char) -> f32 {
     }
 }
 
-pub fn estimate_text_width(s: &str, scale: f32) -> f32 {
-    s.chars().map(approx_char_advance).sum::<f32>() * scale
+fn fallback_text_width_px(s: &str, font_size: f32, bold: bool) -> f32 {
+    let scale = (font_size / 14.5) * if bold { 1.05 } else { 1.0 };
+    s.chars().map(fallback_glyph_advance_14_5).sum::<f32>() * scale
 }
 
-pub fn wrap_text_lines(text: &str, max_line_px: f32) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let limit = max_line_px.max(80.0);
-    let mut out = Vec::new();
+fn fallback_wrap_without_system_fonts(
+    text: &str,
+    limit: f32,
+    font_size: f32,
+) -> WrappedTextLayout {
+    let scale = font_size / 14.5;
+    let mut lines = Vec::new();
+    let mut widest_line_px = 0.0_f32;
+    let mut last_line_px = 0.0_f32;
 
     for paragraph in text.split('\n') {
         if paragraph.is_empty() {
-            out.push(String::new());
+            lines.push(String::new());
+            last_line_px = 0.0;
             continue;
         }
-
         let mut current = String::new();
         let mut current_w = 0.0_f32;
 
-        for word in paragraph.split_inclusive(' ') {
-            let word_w = estimate_text_width(word, 1.0);
-            if current.is_empty() {
-                if word_w <= limit {
-                    current.push_str(word);
-                    current_w = word_w;
-                } else {
-                    // Hard-break extra-long unbroken token (e.g. long URL or hash)
-                    for ch in word.chars() {
-                        let cw = approx_char_advance(ch);
-                        if current_w + cw > limit && !current.is_empty() {
-                            out.push(std::mem::take(&mut current));
-                            current_w = 0.0;
-                        }
-                        current.push(ch);
-                        current_w += cw;
-                    }
-                }
-            } else if current_w + word_w <= limit {
-                current.push_str(word);
-                current_w += word_w;
-            } else {
-                out.push(current.trim_end().to_owned());
+        for ch in paragraph.chars() {
+            let cw = fallback_glyph_advance_14_5(ch) * scale;
+            if current_w + cw > limit && !current.is_empty() {
+                let trimmed = current.trim_end().to_owned();
+                let w = fallback_text_width_px(&trimmed, font_size, false);
+                widest_line_px = widest_line_px.max(w);
+                last_line_px = w;
+                lines.push(trimmed);
                 current.clear();
                 current_w = 0.0;
-
-                if word_w <= limit {
-                    current.push_str(word);
-                    current_w = word_w;
-                } else {
-                    for ch in word.chars() {
-                        let cw = approx_char_advance(ch);
-                        if current_w + cw > limit && !current.is_empty() {
-                            out.push(std::mem::take(&mut current));
-                            current_w = 0.0;
-                        }
-                        current.push(ch);
-                        current_w += cw;
-                    }
+                if ch == ' ' {
+                    continue;
                 }
             }
+            current.push(ch);
+            current_w += cw;
         }
 
         if !current.is_empty() {
-            out.push(current.trim_end().to_owned());
+            let trimmed = current.trim_end().to_owned();
+            let w = fallback_text_width_px(&trimmed, font_size, false);
+            widest_line_px = widest_line_px.max(w);
+            last_line_px = w;
+            lines.push(trimmed);
         }
     }
 
-    out
+    WrappedTextLayout {
+        lines,
+        widest_line_px,
+        last_line_px,
+    }
+}
+
+/// Measures single-line glyph advance width in pixels via `cosmic-text` (`HarfRust` shaping).
+#[inline]
+pub fn measure_text_px(s: &str, font_size: f32, bold: bool) -> f32 {
+    COSMIC_MEASURER.with(|m| m.borrow_mut().measure_single_line(s, font_size, bold))
+}
+
+#[inline]
+pub fn estimate_text_width(s: &str, scale: f32) -> f32 {
+    measure_text_px(s, 14.5 * scale.max(0.1), false)
+}
+
+#[inline]
+pub fn wrap_text_lines_measured(
+    text: &str,
+    max_line_px: f32,
+    font_size: f32,
+) -> WrappedTextLayout {
+    COSMIC_MEASURER.with(|m| m.borrow_mut().wrap_and_measure(text, max_line_px, font_size))
+}
+
+pub fn wrap_text_lines(text: &str, max_line_px: f32) -> Vec<String> {
+    wrap_text_lines_measured(text, max_line_px, 14.5).lines
 }
 
 /// Computes exact bubble width, wrapped lines, inline timestamp reflow, and total row height.
@@ -158,24 +436,19 @@ pub fn measure_bubble_layout(
 
     let show_sender_header = is_group_chat && !msg.is_outgoing && group_pos.is_group_start();
 
-    let lines = wrap_text_lines(&msg.text, max_inner_w);
-    let widest_line = lines
-        .iter()
-        .map(|l| estimate_text_width(l, 1.0))
-        .fold(0.0_f32, f32::max);
+    let wrapped = wrap_text_lines_measured(&msg.text, max_inner_w, 14.5);
+    let widest_line = wrapped.widest_line_px;
+    let last_line_w = wrapped.last_line_px;
+    let lines = wrapped.lines;
 
-    let meta_reserve_w = if msg.is_outgoing { 60.0 } else { 42.0 };
+    let time_w = measure_text_px(&msg.time_label, 11.5, false);
+    let meta_reserve_w = time_w + if msg.is_outgoing { 24.0 } else { 6.0 };
     let header_name_w = if show_sender_header {
-        estimate_text_width(&msg.sender_name, 0.96) + 8.0
+        measure_text_px(&msg.sender_name, 13.0, true) + 8.0
     } else {
         0.0
     };
     let media_min_w = if msg.media.is_some() { 248.0 } else { 0.0 };
-
-    let last_line_w = lines
-        .last()
-        .map(|l| estimate_text_width(l, 1.0))
-        .unwrap_or(0.0);
 
     let inline_meta = !lines.is_empty() && (last_line_w + meta_reserve_w + 12.0 <= max_inner_w);
 
@@ -247,27 +520,8 @@ pub fn extract_initials(title: &str) -> String {
     }
 }
 
-fn truncate_to_px(s: &str, max_px: f32, scale: f32) -> String {
-    if max_px <= 20.0 {
-        return String::new();
-    }
-    let full = estimate_text_width(s, scale);
-    if full <= max_px {
-        return s.to_owned();
-    }
-    let target = (max_px - 14.0).max(8.0);
-    let mut acc = 0.0;
-    let mut out = String::new();
-    for ch in s.chars() {
-        let w = approx_char_advance(ch) * scale;
-        if acc + w > target {
-            break;
-        }
-        out.push(ch);
-        acc += w;
-    }
-    out.push('…');
-    out
+fn truncate_to_px(s: &str, max_px: f32, font_size: f32, bold: bool) -> String {
+    COSMIC_MEASURER.with(|m| m.borrow_mut().truncate_single_line(s, max_px, font_size, bold))
 }
 
 // ============================================================================
@@ -604,7 +858,7 @@ impl<Message> canvas::Program<Message> for DialogRowCanvas {
             TEXT_SUB
         };
         let time_str = &self.dialog.top_time_label;
-        let time_w = estimate_text_width(time_str, 0.85);
+        let time_w = measure_text_px(time_str, 12.2, false);
         frame.fill_text(Text {
             content: time_str.clone(),
             position: Point::new(w - right_margin, 16.0),
@@ -630,7 +884,7 @@ impl<Message> canvas::Program<Message> for DialogRowCanvas {
 
         // 3. Top-left bold chat title
         let title_avail = (title_max_right - text_left).max(40.0);
-        let clipped_title = truncate_to_px(&self.dialog.title, title_avail, 1.02);
+        let clipped_title = truncate_to_px(&self.dialog.title, title_avail, 14.5, true);
         frame.fill_text(Text {
             content: clipped_title,
             position: Point::new(text_left, 14.0),
@@ -651,7 +905,7 @@ impl<Message> canvas::Program<Message> for DialogRowCanvas {
             } else {
                 self.dialog.unread_count.to_string()
             };
-            let badge_w = (estimate_text_width(&badge_txt, 0.88) + 12.0).max(20.0);
+            let badge_w = (measure_text_px(&badge_txt, 11.8, true) + 12.0).max(20.0);
             let badge_h = 20.0_f32;
             let bx = w - right_margin - badge_w;
             let by = 40.0_f32;
@@ -686,7 +940,7 @@ impl<Message> canvas::Program<Message> for DialogRowCanvas {
         // 5. Bottom-left Typing Indicator or Last Message Preview
         let preview_avail = (preview_max_right - text_left).max(40.0);
         if let Some(ref typing_str) = self.typing_label {
-            let clipped_typing = truncate_to_px(typing_str, preview_avail, 0.94);
+            let clipped_typing = truncate_to_px(typing_str, preview_avail, 13.5, false);
             frame.fill_text(Text {
                 content: clipped_typing,
                 position: Point::new(text_left, 41.0),
@@ -711,7 +965,7 @@ impl<Message> canvas::Program<Message> for DialogRowCanvas {
                 self.dialog.top_preview.clone()
             };
 
-            let clipped_preview = truncate_to_px(&full_preview, preview_avail, 0.94);
+            let clipped_preview = truncate_to_px(&full_preview, preview_avail, 13.5, false);
             frame.fill_text(Text {
                 content: clipped_preview,
                 position: Point::new(text_left, 41.0),
@@ -1013,7 +1267,7 @@ fn draw_media_card(
     let max_text_w = (rect.width - 60.0).max(60.0);
 
     frame.fill_text(Text {
-        content: truncate_to_px(&media.attachment.file_name, max_text_w, 0.96),
+        content: truncate_to_px(&media.attachment.file_name, max_text_w, 13.2, true),
         position: Point::new(text_x, rect.y + 7.0),
         color: TEXT_MAIN,
         size: Pixels(13.2),
@@ -1025,7 +1279,7 @@ fn draw_media_card(
     });
 
     frame.fill_text(Text {
-        content: truncate_to_px(&status_line, max_text_w, 0.85),
+        content: truncate_to_px(&status_line, max_text_w, 11.5, false),
         position: Point::new(text_x, rect.y + 25.0),
         color: if is_outgoing { TEXT_TIME_OUT } else { ACCENT_TEXT },
         size: Pixels(11.5),
@@ -1134,4 +1388,33 @@ fn build_telegram_bubble_path(
         }
         b.close();
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cosmic_text_wrapping_and_truncation() {
+        let wrapped = wrap_text_lines_measured(
+            "Проверка точного замера глифов через cosmic-text!\n\nhttps://example.org/very_long_unbroken_path_segment_for_glyph_fallback_wrapping_1234567890",
+            220.0,
+            14.5,
+        );
+        assert!(wrapped.lines.len() >= 4);
+        assert!(wrapped.lines.iter().any(|l| l.is_empty()));
+        assert!(wrapped.widest_line_px > 0.0);
+
+        let short = truncate_to_px("Telegram", 200.0, 14.5, true);
+        assert_eq!(short, "Telegram");
+
+        let clipped = truncate_to_px(
+            "Очень длинный заголовок группового чата разработчиков нативного Rust",
+            140.0,
+            14.5,
+            true,
+        );
+        assert!(clipped.ends_with('…'));
+        assert!(measure_text_px(&clipped, 14.5, true) <= 145.0);
+    }
 }

@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.80"
+rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal shared wire & crypto protocol crate
@@ -39,8 +39,11 @@ dashmap = "6.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 
-# Client native GPU UI (wgpu: Direct3D 12 / Vulkan / Metal) & SQLite WAL storage
+# Client native GPU UI (wgpu: Direct3D 12 / Vulkan / Metal), cosmic-text glyph shaper, OS Keychain & SQLite WAL storage
 iced = { version = "0.13", features = ["canvas", "tokio", "advanced"] }
+cosmic-text = "0.19"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+time = { version = "0.3", features = ["local-offset"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 crossbeam-channel = "0.5"
 rfd = "0.15"
@@ -53,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Aggressive AOT native binary optimization (<200ms startup, minimal RSS)
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
