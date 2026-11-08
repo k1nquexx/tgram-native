@@ -625,3 +625,297 @@ fn production_signing_key_loader_fails_closed_without_valid_seed() {
     let key = parse_production_signing_key(Some(&valid_hex)).expect("valid 64-char hex seed");
     assert_eq!(key.to_bytes(), [0x42u8; 32]);
 }
+
+#[tokio::test]
+async fn cross_chat_same_client_random_id_delivers_independently() {
+    // Static SQL schema regression check for H-04
+    let schema_sql = include_str!("../migrations/001_init.sql");
+    assert!(
+        schema_sql.contains("uq_chat_sender_random_id UNIQUE (chat_id, sender_id, client_random_id)"),
+        "001_init.sql must scope message idempotency uniqueness to (chat_id, sender_id, client_random_id)"
+    );
+    assert!(
+        !schema_sql.contains("UNIQUE (sender_id, client_random_id)"),
+        "legacy cross-chat uq_sender_random_id constraint must not remain in schema"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let temp_media = std::env::temp_dir().join(format!(
+        "tgram_test_h04_random_id_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_media).await;
+
+    let server_key = generate_server_signing_key();
+    let server_pub = server_key.verifying_key();
+    let cfg = ServerConfig {
+        bind_addr: addr,
+        signing_key: server_key,
+        database_url: None,
+        redis_url: None,
+        media_dir: temp_media.clone(),
+        handshake_timeout: Duration::from_secs(5),
+        unauth_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(30),
+        max_connections: 1024,
+        max_uploads_per_user: 4,
+        max_total_uploads: 64,
+        upload_session_ttl: Duration::from_secs(60),
+        seed_demo_data: false,
+    };
+
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let srv_handle = tokio::spawn(async move {
+        run_with_listener(listener, cfg, async move {
+            let _ = stop_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    let mut alice = TestWireClient::connect(addr, &server_pub).await;
+    let mut bob = TestWireClient::connect(addr, &server_pub).await;
+    let mut charlie = TestWireClient::connect(addr, &server_pub).await;
+
+    let _alice_uid = alice.register_user(1, "alice_h04", "Alice").await;
+    let bob_uid = bob.register_user(1, "bob_h04", "Bob").await;
+    let charlie_uid = charlie.register_user(1, "charlie_h04", "Charlie").await;
+
+    let colliding_random_id = 424_242_u64;
+
+    // 1. Alice sends message to Bob with client_random_id = 424_242
+    alice
+        .send_proto(
+            Opcode::SendMessageReq,
+            10,
+            &SendMessageRequest {
+                chat_id: 0,
+                target_user_id: bob_uid,
+                client_random_id: colliding_random_id,
+                text: "Сообщение только для Боба".to_owned(),
+                reply_to_msg_id: 0,
+                media_id: String::new(),
+            },
+        )
+        .await;
+    let ack_bob: SendMessageAck = alice.recv_rpc_reply(10).await.decode_proto().unwrap();
+    let push_bob: NewMessageUpdate = bob
+        .recv_matching(Opcode::NewMessageUpdate)
+        .await
+        .decode_proto()
+        .unwrap();
+    assert_eq!(push_bob.message.unwrap().text, "Сообщение только для Боба");
+
+    // 2. Alice sends message to Charlie reusing the EXACT SAME client_random_id = 424_242
+    alice
+        .send_proto(
+            Opcode::SendMessageReq,
+            11,
+            &SendMessageRequest {
+                chat_id: 0,
+                target_user_id: charlie_uid,
+                client_random_id: colliding_random_id,
+                text: "Независимое сообщение для Чарли".to_owned(),
+                reply_to_msg_id: 0,
+                media_id: String::new(),
+            },
+        )
+        .await;
+    let ack_charlie: SendMessageAck = alice.recv_rpc_reply(11).await.decode_proto().unwrap();
+    assert_ne!(
+        ack_charlie.chat_id, ack_bob.chat_id,
+        "colliding client_random_id across distinct chats must never misroute to first chat (H-04)"
+    );
+    assert_ne!(ack_charlie.msg_id, ack_bob.msg_id);
+
+    let push_charlie: NewMessageUpdate = charlie
+        .recv_matching(Opcode::NewMessageUpdate)
+        .await
+        .decode_proto()
+        .unwrap();
+    assert_eq!(
+        push_charlie.message.unwrap().text,
+        "Независимое сообщение для Чарли"
+    );
+
+    // 3. Genuine retry within the SAME chat (Bob's chat_id) STILL deduplicates idempotently
+    alice
+        .send_proto(
+            Opcode::SendMessageReq,
+            12,
+            &SendMessageRequest {
+                chat_id: ack_bob.chat_id,
+                target_user_id: 0,
+                client_random_id: colliding_random_id,
+                text: "Сообщение только для Боба".to_owned(),
+                reply_to_msg_id: 0,
+                media_id: String::new(),
+            },
+        )
+        .await;
+    let ack_retry: SendMessageAck = alice.recv_rpc_reply(12).await.decode_proto().unwrap();
+    assert_eq!(ack_retry.chat_id, ack_bob.chat_id);
+    assert_eq!(ack_retry.msg_id, ack_bob.msg_id);
+
+    let _ = stop_tx.send(());
+    let _ = srv_handle.await;
+    let _ = tokio::fs::remove_dir_all(&temp_media).await;
+}
+
+#[tokio::test]
+async fn slow_consumer_backpressure_disconnects_stalled_session() {
+    use std::sync::Arc;
+    use tgram_proto::ChatMessage;
+    use tgram_server::connection::serve_connection;
+    use tgram_server::hub::{OutboundPacket, RealtimeHub, SESSION_OUTBOX_CAPACITY};
+    use tgram_server::media::MediaManager;
+    use tgram_server::store::StorageEngine;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let temp_media = std::env::temp_dir().join(format!(
+        "tgram_test_m05_backpressure_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_media).await;
+
+    let server_key = generate_server_signing_key();
+    let server_pub = server_key.verifying_key();
+    let cfg = Arc::new(ServerConfig {
+        bind_addr: addr,
+        signing_key: server_key,
+        database_url: None,
+        redis_url: None,
+        media_dir: temp_media.clone(),
+        handshake_timeout: Duration::from_secs(5),
+        unauth_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(60),
+        max_connections: 128,
+        max_uploads_per_user: 4,
+        max_total_uploads: 64,
+        upload_session_ttl: Duration::from_secs(60),
+        seed_demo_data: false,
+    });
+
+    let store = StorageEngine::new_memory(false);
+    let media = Arc::new(MediaManager::new(temp_media.clone()).await.unwrap());
+    let hub = RealtimeHub::new(store, media);
+
+    let hub_srv = Arc::clone(&hub);
+    let cfg_srv = Arc::clone(&cfg);
+    let conn_join = tokio::spawn(async move {
+        let (stream, peer_addr) = listener.accept().await.unwrap();
+        serve_connection(stream, peer_addr, cfg_srv, hub_srv).await;
+    });
+
+    // Connect SlowBob, register, and then STOP reading from `slow_bob.stream` completely
+    let mut slow_bob = TestWireClient::connect(addr, &server_pub).await;
+    let bob_uid = slow_bob.register_user(1, "slow_bob", "Slow Bob").await;
+    assert!(hub.is_user_online(bob_uid));
+    assert_eq!(hub.active_socket_count(), 1);
+
+    // Flood SlowBob's session with 8,192 large push frames (~16 MiB) so OS TCP buffers saturate
+    // AND `SESSION_OUTBOX_CAPACITY` (1,024) overflows with `TrySendError::Full`
+    let big_text = "X".repeat(2048);
+    let flood_pkt = OutboundPacket::from_proto(
+        Opcode::NewMessageUpdate,
+        flags::SERVER_PUSH,
+        0,
+        &NewMessageUpdate {
+            message: Some(ChatMessage {
+                msg_id: 99,
+                chat_id: 1,
+                sender_id: 1,
+                client_random_id: 1,
+                timestamp_ms: 1_000,
+                text: big_text,
+                reply_to_msg_id: 0,
+                media: None,
+                is_read: false,
+                pts: 2,
+            }),
+            sender_brief: None,
+            unread_count: 1,
+        },
+    );
+
+    for _ in 0..(SESSION_OUTBOX_CAPACITY * 8) {
+        hub.push_to_user(bob_uid, flood_pkt.clone(), None);
+        if !hub.is_user_online(bob_uid) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !hub.is_user_online(bob_uid),
+        "stalled slow consumer must be marked disconnected on outbound queue overflow (M-05)"
+    );
+
+    // Verify `serve_connection` aborts cleanly without hanging on zero-window `write_all`
+    tokio::time::timeout(Duration::from_secs(2), conn_join)
+        .await
+        .expect("serve_connection hung instead of terminating slow consumer")
+        .unwrap();
+    assert_eq!(hub.active_socket_count(), 0);
+
+    drop(slow_bob);
+    let _ = tokio::fs::remove_dir_all(&temp_media).await;
+}
+
+#[tokio::test]
+async fn login_timing_mitigation_executes_argon2id_for_unknown_user() {
+    use std::time::Instant;
+    use tgram_server::auth::verify_password_constant_time;
+    use tgram_server::store::{escape_sql_like, StorageEngine};
+
+    // Verify SQL LIKE wildcard escaping (L-01)
+    assert_eq!(escape_sql_like("100%_raw\\q"), "100\\%\\_raw\\\\q");
+
+    // Verify constant-work Argon2id equalizer runs full memory-hard verification on `None` / empty PHC (M-01)
+    let t0 = Instant::now();
+    let res_none = verify_password_constant_time("probe_password".to_owned(), None)
+        .await
+        .unwrap();
+    let elapsed_none = t0.elapsed();
+    assert!(!res_none);
+    assert!(
+        elapsed_none >= Duration::from_millis(2),
+        "non-existent user login must execute full Argon2id work rather than returning in microseconds"
+    );
+
+    let store = StorageEngine::new_memory(false);
+    store
+        .authenticate(AuthRequest {
+            method: AuthMethod::Register as i32,
+            username: "real_alice".to_owned(),
+            password: "correct_password_123".to_owned(),
+            display_name: "Alice".to_owned(),
+            session_token: Vec::new(),
+            device_name: "Test".to_owned(),
+            last_known_pts: 0,
+        })
+        .await
+        .unwrap();
+
+    let t_ghost = Instant::now();
+    let err_ghost = store
+        .authenticate(AuthRequest {
+            method: AuthMethod::Login as i32,
+            username: "ghost_nonexistent".to_owned(),
+            password: "wrong_password_123".to_owned(),
+            display_name: String::new(),
+            session_token: Vec::new(),
+            device_name: "Test".to_owned(),
+            last_known_pts: 0,
+        })
+        .await
+        .expect_err("ghost user must fail login");
+    let d_ghost = t_ghost.elapsed();
+    assert_eq!(err_ghost.to_rpc_error().code, ErrorCode::InvalidCredentials as i32);
+    assert!(
+        d_ghost >= Duration::from_millis(2),
+        "MemoryStore::authenticate(Login) must run dummy Argon2id for unknown usernames (M-01)"
+    );
+}

@@ -15,9 +15,9 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tgram_proto::{
     flags, parse_verifying_key_hex, perform_client_handshake, AuthMethod, AuthRequest,
     AuthResponse, CreateDirectChatRequest, CreateDirectChatResponse, DecodedFrame,
@@ -34,8 +34,26 @@ use crate::domain::{
 };
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
+const PONG_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy)]
+struct KeepAliveConfig {
+    ping_interval: Duration,
+    pong_timeout: Duration,
+    reconnect_base_ms: u64,
+}
+
+impl Default for KeepAliveConfig {
+    fn default() -> Self {
+        Self {
+            ping_interval: PING_INTERVAL,
+            pong_timeout: PONG_WATCHDOG_TIMEOUT,
+            reconnect_base_ms: 250,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RawWireOutbound {
@@ -83,6 +101,21 @@ impl SessionRpcClient {
         Req: Message,
         Res: Message + Default,
     {
+        self.call_with_timeout(opcode, expected_res, req, RPC_TIMEOUT)
+            .await
+    }
+
+    async fn call_with_timeout<Req, Res>(
+        &self,
+        opcode: Opcode,
+        expected_res: Opcode,
+        req: &Req,
+        call_timeout: Duration,
+    ) -> Result<Res, String>
+    where
+        Req: Message,
+        Res: Message + Default,
+    {
         let req_id = self.next_id();
         let (tx, rx) = oneshot::channel();
         {
@@ -100,7 +133,7 @@ impl SessionRpcClient {
             return Err("соединение разорвано".to_owned());
         }
 
-        let frame = match timeout(RPC_TIMEOUT, rx).await {
+        let frame = match timeout(call_timeout, rx).await {
             Ok(Ok(Ok(f))) => f,
             Ok(Ok(Err(rpc_err))) => return Err(rpc_err),
             Ok(Err(_)) => return Err("канал ответа закрыт".to_owned()),
@@ -173,9 +206,19 @@ pub fn spawn_network_thread(
 }
 
 async fn network_supervisor_loop(
+    cmd_rx: UnboundedReceiver<NetCommand>,
+    storage_tx: CrossbeamSender<StorageCommand>,
+    ui_tx: UnboundedSender<BackendEvent>,
+) {
+    network_supervisor_loop_with_keepalive(cmd_rx, storage_tx, ui_tx, KeepAliveConfig::default())
+        .await;
+}
+
+async fn network_supervisor_loop_with_keepalive(
     mut cmd_rx: UnboundedReceiver<NetCommand>,
     storage_tx: CrossbeamSender<StorageCommand>,
     ui_tx: UnboundedSender<BackendEvent>,
+    keepalive: KeepAliveConfig,
 ) {
     let mut target: Option<ActiveConnectionTarget> = None;
     let mut outbox_queue: VecDeque<SendMessageRequest> = VecDeque::new();
@@ -217,7 +260,10 @@ async fn network_supervisor_loop(
                     attempt: reconnect_attempt,
                 },
             ));
-            let backoff_ms = (250_u64.saturating_mul(1_u64 << reconnect_attempt.min(5))).min(5_000);
+            let backoff_ms = (keepalive
+                .reconnect_base_ms
+                .saturating_mul(1_u64 << reconnect_attempt.min(5)))
+            .min(5_000);
             tokio::select! {
                 _ = sleep(Duration::from_millis(backoff_ms)) => {}
                 maybe_cmd = cmd_rx.recv() => {
@@ -271,6 +317,7 @@ async fn network_supervisor_loop(
             &mut outbox_queue,
             &storage_tx,
             &ui_tx,
+            keepalive,
         )
         .await;
 
@@ -358,12 +405,24 @@ enum CycleExit {
     ChannelClosed,
 }
 
+async fn wait_session_dead(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
+}
+
 async fn run_single_connection_cycle(
     target: &ActiveConnectionTarget,
     cmd_rx: &mut UnboundedReceiver<NetCommand>,
     outbox_queue: &mut VecDeque<SendMessageRequest>,
     storage_tx: &CrossbeamSender<StorageCommand>,
     ui_tx: &UnboundedSender<BackendEvent>,
+    keepalive: KeepAliveConfig,
 ) -> CycleExit {
     let mut stream = match timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(&target.server_addr)).await
     {
@@ -399,31 +458,81 @@ async fn run_single_connection_cycle(
     let (mut read_half, mut write_half) = stream.into_split();
     let (wire_tx, mut wire_rx) = unbounded_channel::<RawWireOutbound>();
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let (session_dead_tx, mut session_dead_rx) = watch::channel(false);
 
     // Spawn dedicated socket writer task for this TCP session
+    let writer_dead_tx = session_dead_tx.clone();
+    let mut writer_dead_rx = session_dead_rx.clone();
     let writer_join = tokio::spawn(async move {
         let mut wire_buf = BytesMut::with_capacity(16 * 1024);
-        while let Some(first) = wire_rx.recv().await {
+        let mut forced_abort = false;
+
+        'writer: loop {
+            let first = tokio::select! {
+                biased;
+                _ = wait_session_dead(&mut writer_dead_rx) => {
+                    forced_abort = true;
+                    break 'writer;
+                }
+                maybe_pkt = wire_rx.recv() => {
+                    match maybe_pkt {
+                        Some(pkt) => pkt,
+                        None => break 'writer,
+                    }
+                }
+            };
+
             wire_buf.clear();
-            if sealer
-                .seal_raw(first.opcode, flags::NONE, first.req_id, &first.payload, &mut wire_buf)
-                .is_err()
-            {
-                break;
+            if let Err(e) = sealer.seal_raw(
+                first.opcode,
+                flags::NONE,
+                first.req_id,
+                &first.payload,
+                &mut wire_buf,
+            ) {
+                error!(error = %e, "fatal client AEAD seal error; terminating session");
+                forced_abort = true;
+                let _ = writer_dead_tx.send(true);
+                break 'writer;
             }
+
             while let Ok(more) = wire_rx.try_recv() {
-                if sealer
-                    .seal_raw(more.opcode, flags::NONE, more.req_id, &more.payload, &mut wire_buf)
-                    .is_err()
-                {
-                    break;
+                if let Err(e) = sealer.seal_raw(
+                    more.opcode,
+                    flags::NONE,
+                    more.req_id,
+                    &more.payload,
+                    &mut wire_buf,
+                ) {
+                    error!(
+                        error = %e,
+                        "fatal client AEAD seal error during packet coalescing; terminating session (M-02)"
+                    );
+                    forced_abort = true;
+                    let _ = writer_dead_tx.send(true);
+                    break 'writer;
                 }
             }
-            if write_half.write_all(&wire_buf).await.is_err() {
-                break;
+
+            tokio::select! {
+                biased;
+                _ = wait_session_dead(&mut writer_dead_rx) => {
+                    forced_abort = true;
+                    break 'writer;
+                }
+                write_res = write_half.write_all(&wire_buf) => {
+                    if write_res.is_err() {
+                        forced_abort = true;
+                        let _ = writer_dead_tx.send(true);
+                        break 'writer;
+                    }
+                }
             }
         }
-        let _ = write_half.shutdown().await;
+
+        if !forced_abort {
+            let _ = write_half.shutdown().await;
+        }
     });
 
     let rpc = SessionRpcClient {
@@ -433,7 +542,8 @@ async fn run_single_connection_cycle(
     };
 
     // Spawn dedicated socket reader task routing RPC replies & real-time Server Pushes
-    let (reader_dead_tx, mut reader_dead_rx) = oneshot::channel::<()>();
+    let reader_dead_tx = session_dead_tx.clone();
+    let mut reader_dead_rx = session_dead_rx.clone();
     let pending_reader = Arc::clone(&pending);
     let storage_reader = storage_tx.clone();
     let ui_reader = ui_tx.clone();
@@ -444,7 +554,12 @@ async fn run_single_connection_cycle(
             if rx_buf.capacity() - rx_buf.len() < 4096 {
                 rx_buf.reserve(8192);
             }
-            match read_half.read_buf(&mut rx_buf).await {
+            let read_res = tokio::select! {
+                biased;
+                _ = wait_session_dead(&mut reader_dead_rx) => break,
+                res = read_half.read_buf(&mut rx_buf) => res,
+            };
+            match read_res {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -455,7 +570,11 @@ async fn run_single_connection_cycle(
                     Ok(None) => break,
                     Err(e) => {
                         warn!(error = %e, "client AEAD frame open failed");
-                        let _ = reader_dead_tx.send(());
+                        let mut map = pending_reader.lock().await;
+                        for (_, tx) in map.drain() {
+                            let _ = tx.send(Err("ошибка расшифровки кадра".to_owned()));
+                        }
+                        let _ = reader_dead_tx.send(true);
                         return;
                     }
                 };
@@ -468,7 +587,7 @@ async fn run_single_connection_cycle(
         for (_, tx) in map.drain() {
             let _ = tx.send(Err("соединение потеряно".to_owned()));
         }
-        let _ = reader_dead_tx.send(());
+        let _ = reader_dead_tx.send(true);
     });
 
     // 1. Authenticate over the encrypted tunnel
@@ -478,6 +597,7 @@ async fn run_single_connection_cycle(
     {
         Ok(res) => res,
         Err(err_msg) => {
+            let _ = session_dead_tx.send(true);
             drop(wire_tx);
             let _ = writer_join.await;
             let _ = reader_join.await;
@@ -486,7 +606,10 @@ async fn run_single_connection_cycle(
     };
 
     let Some(profile) = auth_res.self_profile else {
+        let _ = session_dead_tx.send(true);
         drop(wire_tx);
+        let _ = writer_join.await;
+        let _ = reader_join.await;
         return CycleExit::AuthRejected("пустой профиль в ответе сервера".to_owned());
     };
 
@@ -524,15 +647,15 @@ async fn run_single_connection_cycle(
         spawn_send_text(&rpc, queued_msg, storage_tx, ui_tx);
     }
 
-    // 3. Steady-state multiplexed event loop (commands + 25s keep-alive Ping + disconnect watch)
-    let mut ping_ticker = interval(PING_INTERVAL);
+    // 3. Steady-state multiplexed event loop (commands + keep-alive Ping watchdog + disconnect watch)
+    let mut ping_ticker = interval(keepalive.ping_interval);
     ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ping_ticker.tick().await; // Skip immediate first tick
 
     let exit = loop {
         tokio::select! {
-            _ = &mut reader_dead_rx => {
-                debug!("TCP reader closed; entering auto-reconnect");
+            _ = wait_session_dead(&mut session_dead_rx) => {
+                debug!("MTWire session marked dead (EOF or Ping watchdog); entering auto-reconnect");
                 break CycleExit::DisconnectedWithToken {
                     server_addr: target.server_addr.clone(),
                     session_token: session_token.clone(),
@@ -543,14 +666,25 @@ async fn run_single_connection_cycle(
             _ = ping_ticker.tick() => {
                 let now_ms = unix_ms();
                 let rpc_ping = rpc.clone();
+                let ping_dead_tx = session_dead_tx.clone();
+                let pong_timeout = keepalive.pong_timeout;
                 tokio::spawn(async move {
-                    let _ = rpc_ping
-                        .call::<_, tgram_proto::PongResponse>(
+                    if let Err(err) = rpc_ping
+                        .call_with_timeout::<_, tgram_proto::PongResponse>(
                             Opcode::Ping,
                             Opcode::Pong,
                             &PingRequest { client_timestamp_ms: now_ms },
+                            pong_timeout,
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(
+                            reason = %err,
+                            timeout_ms = pong_timeout.as_millis() as u64,
+                            "MTWire Ping/Pong watchdog expired on half-open socket; forcing reconnect (H-02)"
+                        );
+                        let _ = ping_dead_tx.send(true);
+                    }
                 });
             }
 
@@ -766,8 +900,18 @@ async fn run_single_connection_cycle(
 
     drop(rpc);
     drop(wire_tx);
+    if !matches!(exit, CycleExit::LoggedOut) {
+        // Force immediate teardown of half-open read/write halves without waiting for OS TCP timeout
+        let _ = session_dead_tx.send(true);
+    }
     let _ = writer_join.await;
     reader_join.abort();
+    {
+        let mut map = pending.lock().await;
+        for (_, tx) in map.drain() {
+            let _ = tx.send(Err("соединение закрыто".to_owned()));
+        }
+    }
     let _ = last_pts;
     exit
 }
@@ -1206,4 +1350,241 @@ fn unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use crossbeam_channel::unbounded;
+    use tokio::net::TcpListener;
+    use tgram_proto::{
+        generate_server_signing_key, perform_server_handshake, PongResponse, UserOnlineState,
+        UserProfile,
+    };
+
+    #[tokio::test]
+    async fn half_open_blackhole_triggers_ping_watchdog_and_auto_reconnect() {
+        let server_key = generate_server_signing_key();
+        let server_pubkey_hex = hex::encode(server_key.verifying_key().to_bytes());
+
+        // 1. Spawn in-process MTWire mock server tracking authentication methods across reconnects
+        let srv_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_listener.local_addr().unwrap();
+        let auth_methods_seen: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let auth_methods_srv = Arc::clone(&auth_methods_seen);
+
+        let srv_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = srv_listener.accept().await {
+                let key_clone = server_key.clone();
+                let seen = Arc::clone(&auth_methods_srv);
+                tokio::spawn(async move {
+                    let Ok((mut sealer, mut opener)) =
+                        perform_server_handshake(&mut stream, &key_clone).await
+                    else {
+                        return;
+                    };
+                    let mut rx_buf = BytesMut::with_capacity(4096);
+                    loop {
+                        match stream.read_buf(&mut rx_buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        while let Ok(Some(frame)) = opener.try_open_next(&mut rx_buf) {
+                            let req_id = frame.header.req_id;
+                            let mut wire = BytesMut::new();
+                            match frame.header.opcode {
+                                Opcode::AuthReq => {
+                                    let req: AuthRequest = frame.decode_proto().unwrap();
+                                    seen.lock().await.push(req.method);
+                                    let res = AuthResponse {
+                                        self_profile: Some(UserProfile {
+                                            user_id: 42,
+                                            username: "watchdog_user".to_owned(),
+                                            display_name: "Watchdog".to_owned(),
+                                            avatar_color_rgb: 0x65AADD,
+                                            avatar_media_id: String::new(),
+                                            status: UserOnlineState::Online as i32,
+                                            last_seen_ms: 1_000,
+                                        }),
+                                        session_token: vec![0x77; 32],
+                                        server_time_ms: 1_000,
+                                        current_pts: 5,
+                                    };
+                                    sealer
+                                        .seal_proto(Opcode::AuthRes, flags::NONE, req_id, &res, &mut wire)
+                                        .unwrap();
+                                }
+                                Opcode::SyncDialogsReq => {
+                                    let res = SyncDialogsResponse {
+                                        dialogs: Vec::new(),
+                                        users: Vec::new(),
+                                        current_pts: 5,
+                                    };
+                                    sealer
+                                        .seal_proto(
+                                            Opcode::SyncDialogsRes,
+                                            flags::NONE,
+                                            req_id,
+                                            &res,
+                                            &mut wire,
+                                        )
+                                        .unwrap();
+                                }
+                                Opcode::Ping => {
+                                    let p: PingRequest = frame.decode_proto().unwrap();
+                                    let pong = PongResponse {
+                                        client_timestamp_ms: p.client_timestamp_ms,
+                                        server_timestamp_ms: p.client_timestamp_ms,
+                                    };
+                                    sealer
+                                        .seal_proto(Opcode::Pong, flags::NONE, req_id, &pong, &mut wire)
+                                        .unwrap();
+                                }
+                                _ => {}
+                            }
+                            if !wire.is_empty() && stream.write_all(&wire).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // 2. Spawn blackhole TCP proxy that silently swallows packets without sending FIN/RST when enabled
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let blackhole = Arc::new(AtomicBool::new(false));
+        let blackhole_proxy = Arc::clone(&blackhole);
+
+        let proxy_task = tokio::spawn(async move {
+            while let Ok((client_sock, _)) = proxy_listener.accept().await {
+                let Ok(server_sock) = TcpStream::connect(srv_addr).await else {
+                    continue;
+                };
+                let bh_c2s = Arc::clone(&blackhole_proxy);
+                let bh_s2c = Arc::clone(&blackhole_proxy);
+                let (mut c_read, mut c_write) = client_sock.into_split();
+                let (mut s_read, mut s_write) = server_sock.into_split();
+
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match c_read.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if !bh_c2s.load(Ordering::Acquire)
+                                    && s_write.write_all(&buf[..n]).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match s_read.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if !bh_s2c.load(Ordering::Acquire)
+                                    && c_write.write_all(&buf[..n]).await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // 3. Launch client network supervisor with tight watchdog intervals (60ms ping / 90ms timeout)
+        let (cmd_tx, cmd_rx) = unbounded_channel::<NetCommand>();
+        let (storage_tx, _storage_rx) = unbounded::<StorageCommand>();
+        let (ui_tx, mut ui_rx) = unbounded_channel::<BackendEvent>();
+
+        let net_join = tokio::spawn(network_supervisor_loop_with_keepalive(
+            cmd_rx,
+            storage_tx,
+            ui_tx,
+            KeepAliveConfig {
+                ping_interval: Duration::from_millis(60),
+                pong_timeout: Duration::from_millis(90),
+                reconnect_base_ms: 40,
+            },
+        ));
+
+        cmd_tx
+            .send(NetCommand::ConnectAndAuth {
+                server_addr: proxy_addr.to_string(),
+                server_pubkey_hex,
+                req: AuthRequest {
+                    method: AuthMethod::Login as i32,
+                    username: "watchdog_user".to_owned(),
+                    password: "secret_password".to_owned(),
+                    display_name: String::new(),
+                    session_token: Vec::new(),
+                    device_name: "Watchdog Test".to_owned(),
+                    last_known_pts: 0,
+                },
+            })
+            .unwrap();
+
+        // Wait for initial `Online` state
+        timeout(Duration::from_secs(2), async {
+            while let Some(ev) = ui_rx.recv().await {
+                if matches!(ev, BackendEvent::ConnectionChanged(ConnectionState::Online)) {
+                    return;
+                }
+            }
+            panic!("ui_rx closed before Online");
+        })
+        .await
+        .expect("timed out waiting for initial Online state");
+
+        // 4. Activate silent half-open blackhole (no TCP FIN/RST!) -> Ping watchdog must fire & reconnect
+        blackhole.store(true, Ordering::Release);
+
+        timeout(Duration::from_secs(2), async {
+            while let Some(ev) = ui_rx.recv().await {
+                if matches!(
+                    ev,
+                    BackendEvent::ConnectionChanged(ConnectionState::Reconnecting { .. })
+                ) {
+                    return;
+                }
+            }
+            panic!("ui_rx closed before Reconnecting");
+        })
+        .await
+        .expect("Ping/Pong watchdog failed to detect half-open blackhole socket (H-02)");
+
+        // 5. Restore link -> supervisor must automatically recover via `TokenResume`
+        blackhole.store(false, Ordering::Release);
+
+        timeout(Duration::from_secs(2), async {
+            while let Some(ev) = ui_rx.recv().await {
+                if matches!(ev, BackendEvent::ConnectionChanged(ConnectionState::Online)) {
+                    return;
+                }
+            }
+            panic!("ui_rx closed before auto-reconnect Online");
+        })
+        .await
+        .expect("supervisor failed to auto-reconnect after half-open recovery");
+
+        let methods = auth_methods_seen.lock().await.clone();
+        assert!(methods.len() >= 2);
+        assert_eq!(methods[0], AuthMethod::Login as i32);
+        assert_eq!(methods[1], AuthMethod::TokenResume as i32);
+
+        drop(cmd_tx);
+        let _ = net_join.await;
+        proxy_task.abort();
+        srv_task.abort();
+    }
 }

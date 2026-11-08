@@ -428,8 +428,8 @@ impl TelegramApp {
                 let max_scroll = (self.active_layout.total_height - view_h).max(0.0);
                 self.history_near_bottom = (max_scroll - offset_y) <= 96.0;
 
-                // Trigger keyset backward pagination when scrolled near top
-                if offset_y < 140.0 {
+                // Trigger keyset backward pagination when scrolled near top while online
+                if offset_y < 140.0 && matches!(self.conn_state, ConnectionState::Online) {
                     if let Some(cid) = self.selected_chat_id {
                         if self.has_more_history.get(&cid).copied().unwrap_or(false)
                             && !self.loading_older_history.contains(&cid)
@@ -801,6 +801,10 @@ impl TelegramApp {
             }
 
             BackendEvent::ConnectionChanged(st) => {
+                if !matches!(st, ConnectionState::Online) {
+                    // Release any in-flight backward pagination locks if the link drops
+                    self.loading_older_history.clear();
+                }
                 self.conn_state = st;
                 Task::none()
             }
@@ -1168,6 +1172,8 @@ impl TelegramApp {
             }
 
             BackendEvent::TransientError(err) => {
+                // Release pagination lock so transient RPC timeouts never deadlock history scroll (H-01)
+                self.loading_older_history.clear();
                 self.toast_error = Some(err);
                 Task::none()
             }

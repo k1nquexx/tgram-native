@@ -6,9 +6,9 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 use tgram_proto::{
     flags, perform_server_handshake, AuthRequest, AuthResponse, CreateDirectChatRequest,
     DecodedFrame, FrameOpener, FrameSealer, GetHistoryRequest, LogoutRequest, LogoutResponse,
@@ -105,8 +105,15 @@ pub async fn serve_connection(
 
     let (read_half, write_half) = stream.into_split();
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundPacket>(SESSION_OUTBOX_CAPACITY);
+    let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
-    let writer_handle = tokio::spawn(writer_loop(conn_id, write_half, sealer, outbound_rx));
+    let writer_handle = tokio::spawn(writer_loop(
+        conn_id,
+        write_half,
+        sealer,
+        outbound_rx,
+        disconnect_rx.clone(),
+    ));
 
     reader_loop(
         conn_id,
@@ -114,6 +121,8 @@ pub async fn serve_connection(
         read_half,
         opener,
         outbound_tx,
+        disconnect_tx,
+        disconnect_rx,
         config,
         &hub,
     )
@@ -124,16 +133,44 @@ pub async fn serve_connection(
     trace!(conn_id, %peer_addr, "TCP session closed");
 }
 
+async fn wait_for_force_disconnect(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
 /// Dedicated write half: batches queued frames into a single reusable `BytesMut` for minimal syscalls.
 async fn writer_loop(
     conn_id: u64,
     mut write_half: OwnedWriteHalf,
     mut sealer: FrameSealer,
     mut outbound_rx: mpsc::Receiver<OutboundPacket>,
+    mut disconnect_rx: watch::Receiver<bool>,
 ) {
     let mut tx_wire = BytesMut::with_capacity(16 * 1024);
+    let mut forced_abort = false;
 
-    while let Some(first_pkt) = outbound_rx.recv().await {
+    'writer: loop {
+        let first_pkt = tokio::select! {
+            biased;
+            _ = wait_for_force_disconnect(&mut disconnect_rx) => {
+                forced_abort = true;
+                break 'writer;
+            }
+            maybe_pkt = outbound_rx.recv() => {
+                match maybe_pkt {
+                    Some(pkt) => pkt,
+                    None => break 'writer,
+                }
+            }
+        };
+
         tx_wire.clear();
         if let Err(e) = sealer.seal_raw(
             first_pkt.opcode,
@@ -142,8 +179,9 @@ async fn writer_loop(
             &first_pkt.payload,
             &mut tx_wire,
         ) {
-            warn!(conn_id, error = %e, "AEAD seal error in writer_loop");
-            break;
+            error!(conn_id, error = %e, "fatal AEAD seal error in writer_loop; terminating session");
+            forced_abort = true;
+            break 'writer;
         }
 
         // Coalesce up to 64 already-queued packets into one write_all syscall under burst load
@@ -151,36 +189,53 @@ async fn writer_loop(
             let Ok(next_pkt) = outbound_rx.try_recv() else {
                 break;
             };
-            if sealer
-                .seal_raw(
-                    next_pkt.opcode,
-                    next_pkt.flags,
-                    next_pkt.req_id,
-                    &next_pkt.payload,
-                    &mut tx_wire,
-                )
-                .is_err()
-            {
-                break;
+            if let Err(e) = sealer.seal_raw(
+                next_pkt.opcode,
+                next_pkt.flags,
+                next_pkt.req_id,
+                &next_pkt.payload,
+                &mut tx_wire,
+            ) {
+                error!(
+                    conn_id,
+                    error = %e,
+                    "fatal AEAD seal error during packet coalescing; terminating session to prevent silent drop"
+                );
+                forced_abort = true;
+                break 'writer;
             }
         }
 
-        if let Err(e) = write_half.write_all(&tx_wire).await {
-            trace!(conn_id, error = %e, "socket write closed");
-            break;
+        tokio::select! {
+            biased;
+            _ = wait_for_force_disconnect(&mut disconnect_rx) => {
+                forced_abort = true;
+                break 'writer;
+            }
+            write_res = write_half.write_all(&tx_wire) => {
+                if let Err(e) = write_res {
+                    trace!(conn_id, error = %e, "socket write closed");
+                    break 'writer;
+                }
+            }
         }
     }
 
-    let _ = write_half.shutdown().await;
+    if !forced_abort {
+        let _ = write_half.shutdown().await;
+    }
 }
 
 /// Dedicated read half: authenticates AEAD frames and dispatches RPC opcodes.
+#[allow(clippy::too_many_arguments)]
 async fn reader_loop(
     conn_id: u64,
     peer_addr: SocketAddr,
     mut read_half: OwnedReadHalf,
     mut opener: FrameOpener,
     outbound_tx: mpsc::Sender<OutboundPacket>,
+    disconnect_tx: watch::Sender<bool>,
+    mut disconnect_rx: watch::Receiver<bool>,
     config: Arc<ServerConfig>,
     hub: &Arc<RealtimeHub>,
 ) {
@@ -199,7 +254,16 @@ async fn reader_loop(
             config.unauth_timeout
         };
 
-        let bytes_read = match timeout(wait_limit, read_half.read_buf(&mut rx_buf)).await {
+        let read_outcome = tokio::select! {
+            biased;
+            _ = wait_for_force_disconnect(&mut disconnect_rx) => {
+                debug!(conn_id, %peer_addr, "session forcibly terminated due to outbound backpressure");
+                break;
+            }
+            res = timeout(wait_limit, read_half.read_buf(&mut rx_buf)) => res,
+        };
+
+        let bytes_read = match read_outcome {
             Ok(Ok(0)) => break, // Clean TCP FIN
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
@@ -233,6 +297,7 @@ async fn reader_loop(
                 &mut limiter,
                 frame,
                 &outbound_tx,
+                &disconnect_tx,
                 hub,
             )
             .await
@@ -261,6 +326,7 @@ async fn dispatch_frame(
     limiter: &mut TokenBucket,
     frame: DecodedFrame,
     outbound_tx: &mpsc::Sender<OutboundPacket>,
+    disconnect_tx: &watch::Sender<bool>,
     hub: &Arc<RealtimeHub>,
 ) -> ServerResult<()> {
     let opcode = frame.header.opcode;
@@ -302,8 +368,13 @@ async fn dispatch_frame(
                 user_id,
                 token_sha256: outcome.token_sha256,
             });
-            hub.bind_user_session(user_id, conn_id, outbound_tx.clone())
-                .await;
+            hub.bind_user_session(
+                user_id,
+                conn_id,
+                outbound_tx.clone(),
+                disconnect_tx.clone(),
+            )
+            .await;
 
             let res = AuthResponse {
                 self_profile: Some(outcome.profile),

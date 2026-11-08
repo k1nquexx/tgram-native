@@ -69,8 +69,48 @@ pub struct MeasuredBubble {
     pub show_sender_header: bool,
 }
 
-const MAX_WRAP_CACHE_ENTRIES: usize = 32_768;
-const MAX_WIDTH_CACHE_ENTRIES: usize = 16_384;
+const WRAP_CACHE_GEN_CAPACITY: usize = 16_384;
+const WIDTH_CACHE_GEN_CAPACITY: usize = 8_192;
+
+/// Two-generation (`hot` + `cold`) bounded cache eliminating `O(N)` full-clear frame spikes (`L-02`).
+/// When `hot` reaches `gen_capacity`, `cold` is dropped in `O(1)` swap and `hot` rotates to `cold`,
+/// keeping all visible viewport glyph metrics warm across capacity rollovers at 120 FPS.
+struct GenerationalCache<K, V> {
+    hot: HashMap<K, V>,
+    cold: HashMap<K, V>,
+    gen_capacity: usize,
+}
+
+impl<K: Eq + Hash + Copy, V: Clone> GenerationalCache<K, V> {
+    fn new(gen_capacity: usize) -> Self {
+        let cap = gen_capacity.max(16);
+        Self {
+            hot: HashMap::with_capacity(cap.min(1024)),
+            cold: HashMap::new(),
+            gen_capacity: cap,
+        }
+    }
+
+    fn get_cloned(&mut self, key: &K) -> Option<V> {
+        if let Some(v) = self.hot.get(key) {
+            return Some(v.clone());
+        }
+        if let Some(v) = self.cold.remove(key) {
+            let out = v.clone();
+            self.insert(*key, v);
+            return Some(out);
+        }
+        None
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.hot.len() >= self.gen_capacity && !self.hot.contains_key(&key) {
+            let next_hot = HashMap::with_capacity(self.gen_capacity.min(1024));
+            self.cold = std::mem::replace(&mut self.hot, next_hot);
+        }
+        self.hot.insert(key, value);
+    }
+}
 
 /// Exact HarfRust-shaped wrapped lines and pixel metrics produced by `cosmic-text`.
 #[derive(Debug, Clone)]
@@ -84,8 +124,8 @@ struct CosmicTextMeasurer {
     font_system: CosmicFontSystem,
     wrap_buffer: CosmicBuffer,
     line_buffer: CosmicBuffer,
-    wrap_cache: HashMap<(u64, usize, u32, u16), WrappedTextLayout>,
-    width_cache: HashMap<(u64, usize, u16, bool), f32>,
+    wrap_cache: GenerationalCache<(u64, usize, u32, u16), WrappedTextLayout>,
+    width_cache: GenerationalCache<(u64, usize, u16, bool), f32>,
 }
 
 impl CosmicTextMeasurer {
@@ -102,8 +142,8 @@ impl CosmicTextMeasurer {
             font_system,
             wrap_buffer,
             line_buffer,
-            wrap_cache: HashMap::with_capacity(1024),
-            width_cache: HashMap::with_capacity(1024),
+            wrap_cache: GenerationalCache::new(WRAP_CACHE_GEN_CAPACITY),
+            width_cache: GenerationalCache::new(WIDTH_CACHE_GEN_CAPACITY),
         }
     }
 
@@ -136,8 +176,8 @@ impl CosmicTextMeasurer {
             (limit_px * 10.0).round() as u32,
             (fs_px * 10.0).round() as u16,
         );
-        if let Some(cached) = self.wrap_cache.get(&cache_key) {
-            return cached.clone();
+        if let Some(cached) = self.wrap_cache.get_cloned(&cache_key) {
+            return cached;
         }
 
         let lh_px = BUBBLE_LINE_HEIGHT.max(fs_px * 1.25);
@@ -188,9 +228,6 @@ impl CosmicTextMeasurer {
             }
         };
 
-        if self.wrap_cache.len() >= MAX_WRAP_CACHE_ENTRIES {
-            self.wrap_cache.clear();
-        }
         self.wrap_cache.insert(cache_key, result.clone());
         result
     }
@@ -207,7 +244,7 @@ impl CosmicTextMeasurer {
             (fs_px * 10.0).round() as u16,
             bold,
         );
-        if let Some(&cached) = self.width_cache.get(&cache_key) {
+        if let Some(cached) = self.width_cache.get_cloned(&cache_key) {
             return cached;
         }
 
@@ -231,9 +268,6 @@ impl CosmicTextMeasurer {
             width = fallback_text_width_px(text, fs_px, bold);
         }
 
-        if self.width_cache.len() >= MAX_WIDTH_CACHE_ENTRIES {
-            self.width_cache.clear();
-        }
         self.width_cache.insert(cache_key, width);
         width
     }
@@ -1416,5 +1450,24 @@ mod tests {
         );
         assert!(clipped.ends_with('…'));
         assert!(measure_text_px(&clipped, 14.5, true) <= 145.0);
+    }
+
+    #[test]
+    fn test_generational_cache_retains_hot_entries_on_rollover() {
+        let mut cache = GenerationalCache::<u32, u32>::new(16);
+        for i in 0..16 {
+            cache.insert(i, i * 10);
+        }
+        // Insert 17th entry -> rotates hot (0..16) into cold without wiping them
+        cache.insert(16, 160);
+        // Visible entry `5` from previous generation is still hit and promoted to hot!
+        assert_eq!(cache.get_cloned(&5), Some(50));
+
+        // Fill second generation completely; `5` stays in the new cold generation while unreferenced `0` expires
+        for i in 100..115 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.get_cloned(&5), Some(50));
+        assert_eq!(cache.get_cloned(&0), None);
     }
 }

@@ -70,8 +70,19 @@ CREATE TABLE IF NOT EXISTS messages (
     body_text        TEXT NOT NULL DEFAULT '',
     reply_to_msg_id  BIGINT NOT NULL DEFAULT 0,
     media_id         VARCHAR(64) REFERENCES media_objects(media_id),
-    CONSTRAINT uq_sender_random_id UNIQUE (sender_id, client_random_id)
+    CONSTRAINT uq_chat_sender_random_id UNIQUE (chat_id, sender_id, client_random_id)
 );
+
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS uq_sender_random_id;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_chat_sender_random_id'
+    ) THEN
+        ALTER TABLE messages
+            ADD CONSTRAINT uq_chat_sender_random_id UNIQUE (chat_id, sender_id, client_random_id);
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_history ON messages (chat_id, msg_id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_media_id ON messages (media_id) WHERE media_id IS NOT NULL;

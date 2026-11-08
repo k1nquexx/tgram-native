@@ -11,17 +11,17 @@ use tgram_proto::{
 };
 
 use crate::auth::{
-    avatar_color_for_id, generate_session_token, hash_password_async, hash_session_token,
-    normalize_username, validate_password, verify_password_async,
+    avatar_color_for_id, dummy_password_phc, generate_session_token, hash_password_async,
+    hash_session_token, normalize_username, validate_password, verify_password_constant_time,
 };
 use crate::error::{ServerError, ServerResult};
 use crate::store::{
-    unix_millis_now, AuthSessionOutcome, MarkReadOutcome, PersistMessageOutcome,
+    escape_sql_like, unix_millis_now, AuthSessionOutcome, MarkReadOutcome, PersistMessageOutcome,
     RecipientDeliveryTarget,
 };
 
 const SCHEMA_SQL: &str = include_str!("../../migrations/001_init.sql");
-const SESSION_CACHE_TTL_SECS: u64 = 30 * 24 * 3600;
+const SESSION_CACHE_TTL_SECS: u64 = 15 * 60;
 const PRESENCE_TTL_SECS: u64 = 90;
 
 pub struct PostgresStore {
@@ -31,6 +31,7 @@ pub struct PostgresStore {
 
 impl PostgresStore {
     pub async fn connect(database_url: &str, redis_url: Option<&str>) -> ServerResult<Self> {
+        let _ = dummy_password_phc();
         let pool = PgPoolOptions::new()
             .max_connections(32)
             .connect(database_url)
@@ -173,21 +174,28 @@ impl PostgresStore {
 
             AuthMethod::Login => {
                 let uname = normalize_username(&req.username)?;
-                let row = sqlx::query(
+                if req.password.len() > 256 {
+                    return Err(ServerError::InvalidCredentials);
+                }
+                let maybe_row = sqlx::query(
                     "SELECT user_id, username, display_name, password_phc, avatar_color_rgb, avatar_media_id, current_pts
                      FROM users WHERE LOWER(username) = $1",
                 )
                 .bind(&uname)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(db_err)?
-                .ok_or(ServerError::InvalidCredentials)?;
+                .map_err(db_err)?;
 
-                let phc: String = row.try_get("password_phc").map_err(db_err)?;
-                if !verify_password_async(req.password, phc).await? {
+                let maybe_phc = match maybe_row.as_ref() {
+                    Some(r) => Some(r.try_get::<String, _>("password_phc").map_err(db_err)?),
+                    None => None,
+                };
+
+                if !verify_password_constant_time(req.password, maybe_phc).await? {
                     return Err(ServerError::InvalidCredentials);
                 }
 
+                let row = maybe_row.ok_or(ServerError::InvalidCredentials)?;
                 let user_id = row.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
                 let current_pts = row.try_get::<i64, _>("current_pts").map_err(db_err)? as u64;
 
@@ -238,23 +246,27 @@ impl PostgresStore {
                     .map_err(|_| ServerError::Unauthorized)?;
                 let token_sha256 = hash_session_token(&raw_token);
 
-                let cached_uid = self.lookup_session_in_redis(&token_sha256).await;
-                let user_id = if let Some(uid) = cached_uid {
-                    uid
-                } else {
-                    let row = sqlx::query(
-                        "UPDATE user_sessions SET last_active_ms = $1 WHERE token_sha256 = $2 RETURNING user_id",
-                    )
-                    .bind(now)
-                    .bind(&token_sha256[..])
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(db_err)?
-                    .ok_or(ServerError::Unauthorized)?;
-                    let uid = row.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
-                    self.cache_session_in_redis(&token_sha256, uid).await;
-                    uid
+                // Always validate session liveness against PostgreSQL so a stale Redis cache
+                // entry can never resurrect a logged-out session (CWE-613).
+                let maybe_session = sqlx::query(
+                    "UPDATE user_sessions SET last_active_ms = $1 WHERE token_sha256 = $2 RETURNING user_id",
+                )
+                .bind(now)
+                .bind(&token_sha256[..])
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+
+                let Some(srow) = maybe_session else {
+                    if let Some(mut r) = self.redis.clone() {
+                        let key = format!("tgram:sess:{}", hex::encode(token_sha256));
+                        let _: Result<(), _> = r.del(key).await;
+                    }
+                    return Err(ServerError::Unauthorized);
                 };
+
+                let user_id = srow.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
+                self.cache_session_in_redis(&token_sha256, user_id).await;
 
                 let urow = sqlx::query(
                     "UPDATE users SET last_seen_ms = $1 WHERE user_id = $2
@@ -293,15 +305,19 @@ impl PostgresStore {
     }
 
     pub async fn revoke_session(&self, token_sha256: &[u8; 32]) -> ServerResult<bool> {
-        if let Some(mut r) = self.redis.clone() {
-            let key = format!("tgram:sess:{}", hex::encode(token_sha256));
-            let _: Result<(), _> = r.del(key).await;
-        }
         let res = sqlx::query("DELETE FROM user_sessions WHERE token_sha256 = $1")
             .bind(&token_sha256[..])
             .execute(&self.pool)
             .await
             .map_err(db_err)?;
+
+        if let Some(mut r) = self.redis.clone() {
+            let key = format!("tgram:sess:{}", hex::encode(token_sha256));
+            r.del::<_, ()>(&key).await.map_err(|e| {
+                tracing::error!(error = %e, "Redis session cache invalidation failed during logout");
+                ServerError::Database(format!("Redis session cache invalidation failed: {e}"))
+            })?;
+        }
         Ok(res.rows_affected() > 0)
     }
 
@@ -359,12 +375,82 @@ impl PostgresStore {
                 .unwrap_or(1);
 
         let rows = sqlx::query(
-            "SELECT c.chat_id, c.peer_type, c.title, c.avatar_color_rgb, c.created_at_ms,
-                    cm.read_inbox_max_msg_id, cm.read_outbox_max_msg_id, cm.is_pinned
-             FROM chat_members cm
-             JOIN chats c ON c.chat_id = cm.chat_id
-             WHERE cm.user_id = $1
-             LIMIT $2",
+            "SELECT uc.chat_id,
+                    uc.peer_type,
+                    uc.title,
+                    uc.avatar_color_rgb,
+                    uc.created_at_ms,
+                    uc.read_inbox_max_msg_id,
+                    uc.read_outbox_max_msg_id,
+                    uc.is_pinned,
+                    p.peer_user_id,
+                    p.peer_name,
+                    p.peer_avatar_color,
+                    m.msg_id,
+                    m.sender_id AS msg_sender_id,
+                    m.client_random_id AS msg_client_random_id,
+                    m.timestamp_ms AS msg_timestamp_ms,
+                    m.body_text AS msg_body_text,
+                    m.reply_to_msg_id AS msg_reply_to_msg_id,
+                    m.media_id,
+                    m.file_name,
+                    m.mime_type,
+                    m.size_bytes,
+                    m.sha256_hash,
+                    m.width,
+                    m.height,
+                    COALESCE(u_cnt.cnt, 0)::BIGINT AS unread_count
+             FROM (
+                 SELECT c.chat_id,
+                        c.peer_type,
+                        c.title,
+                        c.avatar_color_rgb,
+                        c.created_at_ms,
+                        cm.read_inbox_max_msg_id,
+                        cm.read_outbox_max_msg_id,
+                        cm.is_pinned
+                 FROM chat_members cm
+                 JOIN chats c ON c.chat_id = cm.chat_id
+                 WHERE cm.user_id = $1
+                 ORDER BY cm.is_pinned DESC, cm.joined_at_ms DESC
+                 LIMIT $2
+             ) uc
+             LEFT JOIN LATERAL (
+                 SELECT u.user_id AS peer_user_id,
+                        u.display_name AS peer_name,
+                        u.avatar_color_rgb AS peer_avatar_color
+                 FROM chat_members cm2
+                 JOIN users u ON u.user_id = cm2.user_id
+                 WHERE cm2.chat_id = uc.chat_id AND cm2.user_id <> $1
+                 LIMIT 1
+             ) p ON uc.peer_type = 1
+             LEFT JOIN LATERAL (
+                 SELECT m1.msg_id,
+                        m1.sender_id,
+                        m1.client_random_id,
+                        m1.timestamp_ms,
+                        m1.body_text,
+                        m1.reply_to_msg_id,
+                        mo.media_id,
+                        mo.file_name,
+                        mo.mime_type,
+                        mo.size_bytes,
+                        mo.sha256_hash,
+                        mo.width,
+                        mo.height
+                 FROM messages m1
+                 LEFT JOIN media_objects mo ON mo.media_id = m1.media_id
+                 WHERE m1.chat_id = uc.chat_id
+                 ORDER BY m1.msg_id DESC
+                 LIMIT 1
+             ) m ON TRUE
+             LEFT JOIN LATERAL (
+                 SELECT COUNT(*)::BIGINT AS cnt
+                 FROM messages m2
+                 WHERE m2.chat_id = uc.chat_id
+                   AND m2.msg_id > uc.read_inbox_max_msg_id
+                   AND m2.sender_id <> $1
+             ) u_cnt ON TRUE",
         )
         .bind(user_id as i64)
         .bind(max_items)
@@ -393,24 +479,21 @@ impl PostgresStore {
 
             let mut peer_user_id = 0_u64;
             if peer_type == PeerType::Direct as i32 {
-                let peer_row = sqlx::query(
-                    "SELECT u.user_id, u.display_name, u.avatar_color_rgb
-                     FROM chat_members cm
-                     JOIN users u ON u.user_id = cm.user_id
-                     WHERE cm.chat_id = $1 AND cm.user_id <> $2
-                     LIMIT 1",
-                )
-                .bind(chat_id as i64)
-                .bind(user_id as i64)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
-
-                if let Some(pr) = peer_row {
-                    peer_user_id = pr.try_get::<i64, _>("user_id").map_err(db_err)? as u64;
-                    title = pr.try_get("display_name").map_err(db_err)?;
-                    avatar_color_rgb =
-                        pr.try_get::<i64, _>("avatar_color_rgb").map_err(db_err)? as u32;
+                let peer_uid_opt: Option<i64> = row.try_get("peer_user_id").map_err(db_err)?;
+                if let Some(puid) = peer_uid_opt {
+                    peer_user_id = puid as u64;
+                    if let Some(pname) = row
+                        .try_get::<Option<String>, _>("peer_name")
+                        .map_err(db_err)?
+                    {
+                        title = pname;
+                    }
+                    if let Some(pcol) = row
+                        .try_get::<Option<i64>, _>("peer_avatar_color")
+                        .map_err(db_err)?
+                    {
+                        avatar_color_rgb = pcol as u32;
+                    }
                     referenced_uids.insert(peer_user_id);
                 } else {
                     peer_user_id = user_id;
@@ -420,23 +503,58 @@ impl PostgresStore {
                 }
             }
 
-            let top_message = self
-                .fetch_latest_message(chat_id, user_id, read_inbox, read_outbox)
-                .await?;
-            if let Some(ref tm) = top_message {
-                referenced_uids.insert(tm.sender_id);
-            }
+            let msg_id_opt: Option<i64> = row.try_get("msg_id").map_err(db_err)?;
+            let top_message = if let Some(raw_mid) = msg_id_opt {
+                let msg_id = raw_mid as u64;
+                let sender_id = row.try_get::<i64, _>("msg_sender_id").map_err(db_err)? as u64;
+                let client_random_id = row
+                    .try_get::<i64, _>("msg_client_random_id")
+                    .map_err(db_err)? as u64;
+                let timestamp_ms: i64 = row.try_get("msg_timestamp_ms").map_err(db_err)?;
+                let text: String = row.try_get("msg_body_text").map_err(db_err)?;
+                let reply_to_msg_id = row
+                    .try_get::<i64, _>("msg_reply_to_msg_id")
+                    .map_err(db_err)? as u64;
 
-            let unread_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND msg_id > $2 AND sender_id <> $3",
-            )
-            .bind(chat_id as i64)
-            .bind(read_inbox as i64)
-            .bind(user_id as i64)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
+                let media_id_opt: Option<String> = row.try_get("media_id").map_err(db_err)?;
+                let media = if let Some(mid) = media_id_opt {
+                    Some(MediaAttachment {
+                        media_id: mid,
+                        file_name: row.try_get("file_name").map_err(db_err)?,
+                        mime_type: row.try_get("mime_type").map_err(db_err)?,
+                        size_bytes: row.try_get::<i64, _>("size_bytes").map_err(db_err)? as u64,
+                        sha256_hash: row.try_get("sha256_hash").map_err(db_err)?,
+                        width: row.try_get::<i32, _>("width").map_err(db_err)? as u32,
+                        height: row.try_get::<i32, _>("height").map_err(db_err)? as u32,
+                    })
+                } else {
+                    None
+                };
 
+                let is_read = if sender_id == user_id {
+                    msg_id <= read_outbox
+                } else {
+                    msg_id <= read_inbox
+                };
+                referenced_uids.insert(sender_id);
+
+                Some(ChatMessage {
+                    msg_id,
+                    chat_id,
+                    sender_id,
+                    client_random_id,
+                    timestamp_ms,
+                    text,
+                    reply_to_msg_id,
+                    media,
+                    is_read,
+                    pts: 0,
+                })
+            } else {
+                None
+            };
+
+            let unread_count: i64 = row.try_get("unread_count").map_err(db_err)?;
             let sort_timestamp_ms = top_message
                 .as_ref()
                 .map(|m| m.timestamp_ms)
@@ -449,7 +567,7 @@ impl PostgresStore {
                 peer_user_id,
                 avatar_color_rgb,
                 top_message,
-                unread_count: unread_count as u32,
+                unread_count: unread_count.max(0) as u32,
                 read_inbox_max_msg_id: read_inbox,
                 read_outbox_max_msg_id: read_outbox,
                 is_pinned,
@@ -577,11 +695,13 @@ impl PostgresStore {
                 dialogs: Vec::new(),
             });
         }
-        let pattern = format!("%{q}%");
+        let escaped_q = escape_sql_like(&q);
+        let pattern = format!("%{escaped_q}%");
         let rows = sqlx::query(
             "SELECT user_id, username, display_name, avatar_color_rgb, avatar_media_id, last_seen_ms
              FROM users
-             WHERE LOWER(username) LIKE $1 OR LOWER(display_name) LIKE $1
+             WHERE LOWER(username) LIKE $1 ESCAPE '\\'
+                OR LOWER(display_name) LIKE $1 ESCAPE '\\'
              LIMIT $2",
         )
         .bind(&pattern)
@@ -782,7 +902,7 @@ impl PostgresStore {
         let inserted = sqlx::query(
             "INSERT INTO messages (chat_id, sender_id, client_random_id, timestamp_ms, body_text, reply_to_msg_id, media_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (sender_id, client_random_id) DO NOTHING
+             ON CONFLICT (chat_id, sender_id, client_random_id) DO NOTHING
              RETURNING msg_id",
         )
         .bind(chat_id as i64)
@@ -800,8 +920,9 @@ impl PostgresStore {
             tx.rollback().await.ok();
             let dup = sqlx::query(
                 "SELECT msg_id, chat_id, timestamp_ms, body_text, reply_to_msg_id
-                 FROM messages WHERE sender_id = $1 AND client_random_id = $2",
+                 FROM messages WHERE chat_id = $1 AND sender_id = $2 AND client_random_id = $3",
             )
+            .bind(chat_id as i64)
             .bind(sender_id as i64)
             .bind(req.client_random_id as i64)
             .fetch_one(&self.pool)
@@ -1087,43 +1208,11 @@ impl PostgresStore {
         Ok(allowed)
     }
 
-    async fn fetch_latest_message(
-        &self,
-        chat_id: u64,
-        viewer_id: u64,
-        read_inbox: u64,
-        read_outbox: u64,
-    ) -> ServerResult<Option<ChatMessage>> {
-        let row = sqlx::query(
-            "SELECT m.msg_id, m.chat_id, m.sender_id, m.client_random_id, m.timestamp_ms,
-                    m.body_text, m.reply_to_msg_id,
-                    mo.media_id, mo.file_name, mo.mime_type, mo.size_bytes, mo.sha256_hash, mo.width, mo.height
-             FROM messages m
-             LEFT JOIN media_objects mo ON mo.media_id = m.media_id
-             WHERE m.chat_id = $1
-             ORDER BY m.msg_id DESC
-             LIMIT 1",
-        )
-        .bind(chat_id as i64)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-
-        row.map(|r| decode_message_row(&r, viewer_id, read_inbox, read_outbox))
-            .transpose()
-    }
-
     async fn cache_session_in_redis(&self, token_sha256: &[u8; 32], user_id: u64) {
         if let Some(mut r) = self.redis.clone() {
             let key = format!("tgram:sess:{}", hex::encode(token_sha256));
             let _: Result<(), _> = r.set_ex(key, user_id, SESSION_CACHE_TTL_SECS).await;
         }
-    }
-
-    async fn lookup_session_in_redis(&self, token_sha256: &[u8; 32]) -> Option<u64> {
-        let mut r = self.redis.clone()?;
-        let key = format!("tgram:sess:{}", hex::encode(token_sha256));
-        r.get::<_, u64>(key).await.ok()
     }
 }
 

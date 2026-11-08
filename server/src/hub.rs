@@ -1,11 +1,12 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use prost::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tracing::warn;
 use tgram_proto::{
     flags, ChatMessage, NewMessageUpdate, Opcode, PresenceUpdate, ReadAckRequest, ReadAckResponse,
     ReadHistoryUpdate, SendMessageAck, SendMessageRequest, TypingEventRequest, TypingUpdate,
@@ -46,6 +47,8 @@ impl OutboundPacket {
 struct SessionHandle {
     conn_id: u64,
     tx: mpsc::Sender<OutboundPacket>,
+    disconnect_tx: watch::Sender<bool>,
+    disconnected: Arc<AtomicBool>,
 }
 
 /// Sharded real-time message router and multi-device session registry.
@@ -92,7 +95,10 @@ impl RealtimeHub {
     pub fn is_user_online(&self, user_id: u64) -> bool {
         self.sessions_by_user
             .get(&user_id)
-            .map(|list| !list.is_empty())
+            .map(|list| {
+                list.iter()
+                    .any(|s| !s.tx.is_closed() && !s.disconnected.load(Ordering::Acquire))
+            })
             .unwrap_or(false)
     }
 
@@ -102,12 +108,22 @@ impl RealtimeHub {
         user_id: u64,
         conn_id: u64,
         tx: mpsc::Sender<OutboundPacket>,
+        disconnect_tx: watch::Sender<bool>,
     ) {
         let became_online = {
             let mut list = self.sessions_by_user.entry(user_id).or_default();
-            list.retain(|s| !s.tx.is_closed() && s.conn_id != conn_id);
+            list.retain(|s| {
+                !s.tx.is_closed()
+                    && !s.disconnected.load(Ordering::Acquire)
+                    && s.conn_id != conn_id
+            });
             let was_offline = list.is_empty();
-            list.push(SessionHandle { conn_id, tx });
+            list.push(SessionHandle {
+                conn_id,
+                tx,
+                disconnect_tx,
+                disconnected: Arc::new(AtomicBool::new(false)),
+            });
             was_offline
         };
 
@@ -170,7 +186,8 @@ impl RealtimeHub {
     }
 
     /// Non-blocking fanout to all active sessions of `user_id`.
-    /// Evicts dead/backpressured channels automatically without stalling the caller.
+    /// On backpressure (`TrySendError::Full`), forcibly disconnects the slow session so the client
+    /// reconnects and reconciles missed `pts` updates without silent state gaps (`M-05`).
     pub fn push_to_user(
         &self,
         user_id: u64,
@@ -184,11 +201,24 @@ impl RealtimeHub {
 
         let mut has_closed = false;
         for h in handles {
-            if Some(h.conn_id) == exclude_conn_id {
+            if Some(h.conn_id) == exclude_conn_id || h.disconnected.load(Ordering::Acquire) {
                 continue;
             }
-            if h.tx.try_send(packet.clone()).is_err() && h.tx.is_closed() {
-                has_closed = true;
+            match h.tx.try_send(packet.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if !h.disconnected.swap(true, Ordering::AcqRel) {
+                        warn!(
+                            user_id,
+                            conn_id = h.conn_id,
+                            "session outbound queue full (backpressure); terminating slow client to force PTS resync"
+                        );
+                        let _ = h.disconnect_tx.send(true);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    has_closed = true;
+                }
             }
         }
 

@@ -1,3 +1,6 @@
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use argon2::{
     password_hash::{
         rand_core::OsRng as PwOsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -9,6 +12,8 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::error::{ServerError, ServerResult};
+
+static DUMMY_PASSWORD_PHC: OnceLock<String> = OnceLock::new();
 
 /// Telegram Desktop Night Blue official 7-color peer avatar palette (`0xRRGGBB`).
 pub const AVATAR_PALETTE_RGB: [u32; 7] = [
@@ -79,6 +84,43 @@ pub async fn verify_password_async(password: String, phc_hash: String) -> Server
     })
     .await
     .map_err(|e| ServerError::Internal(format!("blocking pool join error: {e}")))
+}
+
+/// Returns a process-cached Argon2id PHC hash generated with identical `Argon2::default()` cost
+/// parameters (`m = 19 MiB, t = 2, p = 1`) so login probes against non-existent usernames expend
+/// indistinguishable CPU and memory bandwidth (`CWE-208` mitigation).
+pub fn dummy_password_phc() -> &'static str {
+    DUMMY_PASSWORD_PHC.get_or_init(|| {
+        let salt = SaltString::generate(&mut PwOsRng);
+        Argon2::default()
+            .hash_password(b"__tgram_constant_time_dummy_secret__", &salt)
+            .expect("Argon2id dummy PHC initialization must succeed")
+            .to_string()
+    })
+}
+
+/// Executes constant-work Argon2id verification whether or not `stored_phc` belongs to an active
+/// user account, preventing username enumeration via response-time side channels (`CWE-208`).
+pub async fn verify_password_constant_time(
+    password: String,
+    stored_phc: Option<String>,
+) -> ServerResult<bool> {
+    let started = Instant::now();
+    let (target_phc, account_valid) = match stored_phc {
+        Some(phc) if !phc.is_empty() => (phc, true),
+        _ => (dummy_password_phc().to_owned(), false),
+    };
+
+    let matched = verify_password_async(password, target_phc).await?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        elapsed_ms,
+        account_valid,
+        authenticated = matched && account_valid,
+        "Argon2id login verification completed"
+    );
+
+    Ok(matched && account_valid)
 }
 
 /// Generates a 32-byte CSPRNG session token `(raw_token_for_client, sha256_digest_for_db)`.

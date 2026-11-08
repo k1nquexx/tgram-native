@@ -8,8 +8,8 @@ use tgram_proto::{
 };
 
 use crate::auth::{
-    avatar_color_for_id, generate_session_token, hash_password_async, hash_session_token,
-    normalize_username, validate_password, verify_password_async,
+    avatar_color_for_id, dummy_password_phc, generate_session_token, hash_password_async,
+    hash_session_token, normalize_username, validate_password, verify_password_constant_time,
 };
 use crate::error::{ServerError, ServerResult};
 use crate::store::{
@@ -81,7 +81,7 @@ struct MemoryState {
     sessions: HashMap<[u8; 32], u64>,
     chats: HashMap<u64, ChatRecord>,
     direct_pairs: HashMap<(u64, u64), u64>,
-    idempotency: HashMap<(u64, u64), (u64, u64)>, // (sender_id, client_random_id) -> (chat_id, msg_id)
+    idempotency: HashMap<(u64, u64, u64), u64>, // (chat_id, sender_id, client_random_id) -> msg_id
     media: HashMap<String, StoredMediaObject>,
 }
 
@@ -92,6 +92,7 @@ pub struct MemoryStore {
 
 impl MemoryStore {
     pub fn new(seed_demo: bool) -> Self {
+        let _ = dummy_password_phc();
         let now = unix_millis_now();
         let mut users = HashMap::new();
         let mut usernames = HashMap::new();
@@ -263,26 +264,26 @@ impl MemoryStore {
 
             AuthMethod::Login => {
                 let uname = normalize_username(&req.username)?;
-                let (user_id, phc) = {
-                    let guard = self.state.read().await;
-                    let uid = guard
-                        .usernames
-                        .get(&uname)
-                        .copied()
-                        .ok_or(ServerError::InvalidCredentials)?;
-                    let rec = guard
-                        .users
-                        .get(&uid)
-                        .ok_or(ServerError::InvalidCredentials)?;
-                    if rec.password_phc.is_empty() {
-                        return Err(ServerError::InvalidCredentials);
-                    }
-                    (uid, rec.password_phc.clone())
-                };
-
-                if !verify_password_async(req.password, phc).await? {
+                if req.password.len() > 256 {
                     return Err(ServerError::InvalidCredentials);
                 }
+                let (maybe_uid, maybe_phc) = {
+                    let guard = self.state.read().await;
+                    if let Some(&uid) = guard.usernames.get(&uname) {
+                        if let Some(rec) = guard.users.get(&uid) {
+                            (Some(uid), Some(rec.password_phc.clone()))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                };
+
+                if !verify_password_constant_time(req.password, maybe_phc).await? {
+                    return Err(ServerError::InvalidCredentials);
+                }
+                let user_id = maybe_uid.ok_or(ServerError::InvalidCredentials)?;
 
                 let mut guard = self.state.write().await;
                 let rec = guard
@@ -617,32 +618,6 @@ impl MemoryStore {
             .ok_or(ServerError::Unauthorized)?
             .to_profile(true);
 
-        // Idempotency check for retry safety across reconnects
-        if let Some(&(existing_chat_id, existing_msg_id)) =
-            guard.idempotency.get(&(sender_id, req.client_random_id))
-        {
-            if let Some(chat) = guard.chats.get(&existing_chat_id) {
-                if let Ok(idx) = chat
-                    .messages
-                    .binary_search_by_key(&existing_msg_id, |m| m.msg_id)
-                {
-                    let msg = chat.messages[idx].clone();
-                    let sender_pts = guard
-                        .users
-                        .get(&sender_id)
-                        .map(|u| u.current_pts)
-                        .unwrap_or(msg.pts);
-                    return Ok(PersistMessageOutcome {
-                        message: msg,
-                        sender_profile,
-                        sender_pts,
-                        recipients: Vec::new(),
-                        was_duplicate: true,
-                    });
-                }
-            }
-        }
-
         // Resolve chat_id (or auto-create direct chat if target_user_id provided)
         let chat_id = if req.chat_id != 0 {
             req.chat_id
@@ -700,7 +675,7 @@ impl MemoryStore {
             ));
         };
 
-        // Verify membership before mutating state
+        // Verify membership before mutating state or returning idempotent cache
         {
             let chat = guard
                 .chats
@@ -708,6 +683,32 @@ impl MemoryStore {
                 .ok_or(ServerError::ChatNotFound(chat_id))?;
             if !chat.members.contains_key(&sender_id) {
                 return Err(ServerError::ChatNotFound(chat_id));
+            }
+        }
+
+        // Per-chat idempotency check scoped to (chat_id, sender_id, client_random_id)
+        if let Some(&existing_msg_id) =
+            guard.idempotency.get(&(chat_id, sender_id, req.client_random_id))
+        {
+            if let Some(chat) = guard.chats.get(&chat_id) {
+                if let Ok(idx) = chat
+                    .messages
+                    .binary_search_by_key(&existing_msg_id, |m| m.msg_id)
+                {
+                    let msg = chat.messages[idx].clone();
+                    let sender_pts = guard
+                        .users
+                        .get(&sender_id)
+                        .map(|u| u.current_pts)
+                        .unwrap_or(msg.pts);
+                    return Ok(PersistMessageOutcome {
+                        message: msg,
+                        sender_profile,
+                        sender_pts,
+                        recipients: Vec::new(),
+                        was_duplicate: true,
+                    });
+                }
             }
         }
 
@@ -778,7 +779,7 @@ impl MemoryStore {
 
         guard
             .idempotency
-            .insert((sender_id, req.client_random_id), (chat_id, msg_id));
+            .insert((chat_id, sender_id, req.client_random_id), msg_id);
 
         Ok(PersistMessageOutcome {
             message,

@@ -218,3 +218,30 @@ pub fn unix_millis_now() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
+
+/// Escapes PostgreSQL `LIKE` pattern metacharacters (`\`, `%`, `_`) so untrusted peer search
+/// queries cannot inject arbitrary wildcard expansions (`ESCAPE '\'`).
+pub fn escape_sql_like(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len() + 4);
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '%' => escaped.push_str("\\%"),
+            '_' => escaped.push_str("\\_"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_sql_like;
+
+    #[test]
+    fn escapes_postgres_like_wildcards_and_backslashes() {
+        assert_eq!(escape_sql_like("alice"), "alice");
+        assert_eq!(escape_sql_like("100%_admin\\test"), "100\\%\\_admin\\\\test");
+        assert_eq!(escape_sql_like("___%%%"), "\\_\\_\\_\\%\\%\\%");
+    }
+}
